@@ -1,0 +1,859 @@
+window.PAGE = {
+ "num": 5,
+ "title": "Evolution of HTTP",
+ "summary": "How HTTP evolved from 1.0 to 1.1, 2 and 3, and the pain that drove each step: per-request connections, missing Host, timestamp caching, head-of-line blocking, header bloat and TCP's in-order delivery. It covers 1.1's persistent connections, ETags, Vary, ranges and chunked encoding, HTTP/2's binary frames, streams and HPACK, and HTTP/3's move to QUIC over UDP.",
+ "notes": [
+  {
+   "heading": "Why study HTTP as an evolution",
+   "body": "The lecture traced HTTP from 1.0 to HTTP/3 and, at each step, asked: **what pain forced the next version?** Each version fixes a bottleneck the previous one exposed, and every fix brings its own new problem.\n\n- **HTTP/0.9** (1991): GET only, no headers, no status codes. Irrelevant today.\n- **HTTP/1.0**: RFC 1945 (1996). Text protocol, one request per TCP connection.\n- **HTTP/1.1**: RFC 2068 (1997), tightened in RFC 2616 (1999), split into six documents RFC 7230–7235 (2014), restructured again in RFC 9110 (semantics), 9111 (caching) and 9112 (HTTP/1.1 wire format) in 2022.\n- **HTTP/2**: grew out of Google's SPDY. RFC 7540 (2015), now replaced by **RFC 9113** (2022).\n- **HTTP/3**: HTTP over **QUIC** (RFC 9000 for QUIC, RFC 9114 for HTTP/3), which runs on UDP.\n\n**RFC** = Request For Comments: someone proposes a standard and asks for feedback. Search \"RFC 1945\" to read one. They're plain text with numbered clauses. The instructor said exam questions come from the slides, not from the RFC text.\n\nAssignments announced in this class:\n- **Assignment:** a calculator server (add, subtract, multiply, divide) written directly on sockets, with no web server or framework. Several requests must reuse **one TCP connection** (one handshake), so you have to decide where each request and response ends. Pipelining is a bonus.\n- **Project:** reimagine HTTP/1.0 or 1.1 as a **binary** protocol. Each student writes either a client or a server, and pairs must agree on a spec so they interoperate. The client must hex-dump responses, because the body may be binary."
+  },
+  {
+   "heading": "Recap quiz from earlier lectures",
+   "body": "The class opened with revision questions. These are fair game for the exam:\n\n- **Not calling `close()`** on a socket: the descriptor and kernel socket stay allocated, which is a **resource leak**, until the process exits and the kernel cleans up. There is no SIGPIPE for this.\n- **Original TCP congestion signal:** **packet loss**. A missing ACK means the network is congested, so the sender slows down. Google's **BBR** instead models bandwidth and RTT.\n- **Defence against SYN floods:** **SYN cookies**, which work at the TCP level. TLS is a layer above TCP and has nothing to do with it.\n- **Two-byte little-endian number:** value = first byte + second byte × 256. For example, bytes `117, 48` give 117 + 48×256 = **12,405**.\n- **Laptop in Bangalore → server in Frankfurt:** the server sees the source IP of the **gateway/NAT** the laptop sits behind, such as a campus gateway, not the laptop's private IP. MAC addresses change on every hop.\n- **SMS \"Hello\":** `H` is 0x48 in ASCII, but the SMS payload starts 0xC8 because of **GSM 7-bit packing**: 160 characters × 7 bits = 1120 bits = 140 bytes. It is not Base64."
+  },
+  {
+   "heading": "HTTP/1.0: the whole protocol on one slide",
+   "body": "HTTP/1.0 is a simple **text** protocol. Lines end with `\\r\\n` (CRLF), and a **blank line** separates the headers from the body.\n\n```\nGET / HTTP/1.0\\r\\n\nUser-Agent: demo\\r\\n\n\\r\\n\n\nHTTP/1.0 200 OK\\r\\n\nDate: ...\\r\\n\nServer: ...\\r\\n\nContent-Length: 1256\\r\\n\nContent-Type: text/html\\r\\n\n\\r\\n\n<html>...\n```\n\n- **Methods:** only **GET, HEAD, POST** are core. PUT, DELETE, LINK and UNLINK appear only as \"additional\" methods in an appendix. **There is no OPTIONS.** HEAD returns the headers without the body.\n- **Headers** (a small fixed set): Date, Pragma, Authorization, From, If-Modified-Since, Referer, User-Agent, Location, Server, **WWW-Authenticate**, Allow, Content-Encoding, Content-Length, Content-Type, Expires, Last-Modified. WWW-Authenticate drives **Basic auth**, where the password travels only Base64-encoded, which is not encryption.\n- **Status codes:** 200, 201 Created, 202 Accepted, **204 No Content** (still popular), 300, 301, 302, **304 Not Modified**, 400, 401, 403, 404, 500, 501, 502, 503.\n\nThe lecture's Python mini-client sends `GET / HTTP/1.0` by hand and prints the raw response. Unlike curl, it hides nothing."
+  },
+  {
+   "heading": "HTTP/1.0's big problems: one connection per request, no Host",
+   "body": "### Connection per request\nRFC 1945 says the client opens the connection and the **server closes it after sending the response**. Every resource pays for a fresh **TCP handshake**, plus a **TLS handshake** if the connection is encrypted. For a small CSS file, you can spend as much time or more on the handshake as on the request and response themselves. **The handshake is costly, and the whole history of HTTP is about avoiding it.** In 1.0 you cannot reuse the socket, because the server closes it by protocol.\n\n### No Host header\nOne IP address can host many sites. CDNs put thousands of sites behind the same IPs, and IPv4 exhaustion made sharing IPs important. HTTP/1.0 had **no way to tell the server which site** the client wanted. The fix is **virtual hosts (vhosts)**: Apache calls them VirtualHost, and in nginx they are `server` blocks with `server_name`. Each Host can get its own config, such as its own folder or its own FastCGI upstream.\n\n- In HTTP/1.1, **Host is mandatory**. A request without it is rejected with **400 Bad Request**.\n- Over TLS the same idea appears as **SNI** (Server Name Indication): the hostname is sent inside the TLS ClientHello so the server can pick the right certificate.\n- In HTTP/2 and HTTP/3 the Host header becomes the **`:authority`** pseudo-header.\n\n### Other gaps in 1.0\nLimited methods and headers, no OPTIONS, no persistent connections, no chunked transfer and no range requests.\n\n**Exam point:** HTTP/1.0 technically has **no HTTP-level head-of-line blocking**. That problem only appears on a *persistent* connection, and 1.0 closes the connection after each response."
+  },
+  {
+   "heading": "Caching in HTTP/1.0: Last-Modified and If-Modified-Since",
+   "body": "Caching was already in 1.0.\n\n1. The server sends `Last-Modified: Tue, 15 Sep 2026 10:00:00 GMT`, a timestamp with a time zone.\n2. Next time, the client asks `If-Modified-Since: <that date>`.\n3. If the resource hasn't changed, the server replies **304 Not Modified** with no body, so the large file isn't downloaded again.\n\nThis is a very good technique: a small check prevents a big transfer. **It saves bandwidth, not requests**, because a full round trip still happens.\n\nProblems with timestamps:\n- **Clock skew and drift.** Server and client clocks disagree, and even phones synced via GPS or the network drift (for example, in a basement).\n- **Granularity is one second.** Two versions saved within the same second look identical.\n- **A timestamp is not identity.** `mtime` (modified time, the value `find -mtime` uses) can change without the content changing, or two servers can hold the same file with different mtimes.\n\n1.0 also had `Expires` (an absolute time) and `Pragma: no-cache`. The instructor said to look these up yourself."
+  },
+  {
+   "heading": "HTTP/1.1: persistent connections, Host, ETags",
+   "body": "### Persistent connections by default\nIn 1.1 the connection **stays open unless someone sends `Connection: close`**. In 1.0, `Connection: keep-alive` was a non-standard extension that many implementations supported anyway. You can try it with telnet or netcat: an HTTP/1.0 request gets closed, while the same request as HTTP/1.1 with a Host header stays open.\n\n### Host header is mandatory\nSee the previous section. One IP and one certificate can serve many real sites.\n\n### ETag validators\nThe server returns `ETag: \"abc123\"`, an opaque version identifier that is often a content hash. The browser stores it against the URL in its cache folder. Then:\n- `If-None-Match: \"abc123\"` on GET: if it still matches, the server returns **304**. This is why a normal refresh doesn't re-download every image, while a **hard refresh** (Shift-refresh) does.\n- `If-Match: \"abc123\"` on PUT or POST: only write if the server still has that version. Otherwise the server returns **412 Precondition Failed**. This prevents lost updates.\n- A **weak** ETag (`W/\"...\"`) means the content is semantically equivalent but not byte-identical. It can't be used with range requests.\n- ETags **don't depend on clocks**, and they still work if a file changes to a new version and later back to an old one.\n\n### Cache-Control\n- `max-age=N`: cache for N seconds. A versioned or hashed asset can be cached for a year.\n- `no-cache`: you may store it, but you **must revalidate** with the origin on every use.\n- `no-store`: never store it at all.\n- **Beyond the lecture:** `s-maxage` applies only to shared caches such as CDNs, `private` means browser-only, and `must-revalidate` means stale copies must not be served. CDNs can be configured to cache an object themselves while still passing `no-cache` downstream so browsers don't cache it. The instructor mentioned that override."
+  },
+  {
+   "heading": "Content negotiation and the Vary header",
+   "body": "HTTP/1.1 added the `Accept-*` headers: `Accept`, `Accept-Language`, `Accept-Charset`, `Accept-Encoding`. With `Accept-Encoding: gzip, deflate, br`, the client says it can decompress. Today gzip and **Brotli (br)** are the common choices, and `identity` means no encoding.\n\n**Vary** tells every cache along the path that the same URL gives **different responses depending on these request headers**. With `Vary: Accept-Encoding`, one URL can have four stored variants (identity, gzip, deflate, br). A cache must not hand a gzip copy to a client that didn't ask for gzip.\n\n```\ncache key = URL + values of the headers named in Vary\n```\n\nThis applies to browsers, proxies, reverse proxies and CDNs alike. **Vary is painful in production:**\n- `Vary: User-Agent` or `Vary: Cookie` splits the cache into a huge number of variants, so the **hit ratio collapses**.\n- `Vary: *` effectively means the response can't be reused from cache.\n\nThe instructor stressed that none of this is just theory: you will use Vary, ETag, Range and chunked encoding in any web job."
+  },
+  {
+   "heading": "Range requests and chunked transfer encoding",
+   "body": "### Range requests (borrowed from FTP's idea of partial transfer)\n```\nGET /video.mp4 HTTP/1.1\nRange: bytes=100-199\n\nHTTP/1.1 206 Partial Content\nContent-Range: bytes 100-199/50000\n```\n- A successful range request returns **206 Partial Content**, not 200. An impossible range, such as one past the end of the file, gets **416 Range Not Satisfiable**. The server advertises support with `Accept-Ranges: bytes`.\n- **Uses:** pause and resume downloads (before ranges, a broken download restarted from zero), **seeking inside a video**, and reading just the index or manifest of a file format that keeps it at the start or end. Data-lake and lakehouse tools read only the parts of files they need this way.\n- **Caching gets tricky:** a cache now holds URL + Vary + byte ranges. A common CDN strategy is to **serve ranges downstream but fetch the whole object upstream**, store it once, and slice it locally. Smarter caches fetch only the missing part. For example, if bytes 100–199 are cached and someone asks for 50–199, they fetch only 50–99.\n\n### Chunked transfer encoding\n`Transfer-Encoding: chunked` lets the sender stream a body **without knowing its total length**. Each chunk is `<length in hex>\\r\\n<data>\\r\\n`, and a **zero-length chunk** ends the body. It's a length-value framing scheme without the type field.\n\n```\n4\\r\\nWiki\\r\\n\n5\\r\\npedia\\r\\n\n0\\r\\n\\r\\n\n```\nUses: streaming JSON and LLM chat responses (the server doesn't know the final size), large uploads, and progressive rendering. This isn't possible in 1.0, where you must send `Content-Length` and the full body, or close the connection to mark the end. Video usually uses ranges instead, because its size is known.\n\n**Beyond the lecture:** a **progressive JPEG** stores a coarse full image first and refines it as more bytes arrive."
+  },
+  {
+   "heading": "More 1.1 additions: OPTIONS, Via, 100-continue, redirects",
+   "body": "- **OPTIONS** asks what the server allows. Browsers use it for the **CORS preflight**: before a cross-origin request with custom headers or credentials, the browser asks the third-party server whether it's allowed. The lecture demo found OPTIONS calls to a third-party domain in Chrome DevTools.\n- **TRACE** exists but is rarely used.\n- **Via:** each proxy on the path appends itself, so you can trace the proxy chain. The final server usually strips it, because it's mainly for debugging.\n- **`Expect: 100-continue`:** before uploading a large body, the client waits for `100 Continue` so it doesn't waste the upload if the server would refuse it.\n- **Redirects:** 301 is permanent and 302 is temporary (\"found\"). Common uses are `http → https`, `example.com ↔ www.example.com`, and moving to a new brand domain. These are **HTTP-level** redirects through the `Location` header, unlike an HTML meta-refresh. Early clients turned a POST into a GET when following a 302, and the RFCs later clarified the intended behaviour. **Beyond the lecture:** 307 and 308 guarantee the method is kept, and 303 explicitly switches to GET.\n- **Lesson on upgrades:** once millions of clients and servers are deployed, **getting everyone to upgrade takes years**. Sometimes getting it right the first time matters, and sometimes leaving room for future extension matters.\n\n### Connection limits, domain sharding and bundlers\nRFC 2616 §8.1.4 said a client **should not maintain more than 2 connections** with a server. With 50 images on a page, they would download two at a time.\n\n- **Domain sharding:** serve assets from `img1.`, `img2.`, `img3.example.com`, all pointing at the same server, to get more parallel connections. Modern browsers allow about **6 per host**, so 3 shards × 6 = **18** connections. The 2-connection rule was later dropped, but browsers still cap at about 6–8.\n- Sharding complicated CDN config: the cache key had to be based on the **origin** file, not the many outward-facing hostnames. CDNs still differ on whether the outward or inward domain is part of the cache key.\n- **Bundlers** (Webpack, Rollup, Gulp) came from the same limit. They ship one big file instead of 20 small ones, which means fewer requests, fewer chances of failure, and less queueing on 2–6 connections.\n- With HTTP/2, many requests share **one** connection concurrently, so sharding becomes counter-productive and bundling matters less."
+  },
+  {
+   "heading": "Postel's law, request smuggling and header character rules",
+   "body": "### Postel's law (the robustness principle)\n**Be conservative in what you send, be liberal in what you accept.** When upgrading an API or app, the server must accept both old and new clients, and a sender should assume the minimum capability unless versions have been negotiated.\n\n### Content-Length vs Transfer-Encoding\nIf a message carries **both** `Content-Length` and `Transfer-Encoding: chunked`, the RFC says **Transfer-Encoding wins and Content-Length must be ignored**. Later revisions say such a message should be treated as suspicious, and the connection closed after it. This is a deliberately *strict* exception to Postel's law, made because ambiguity is an attack vector:\n\n```\nPOST / HTTP/1.1\nHost: a.com\nContent-Length: 6\nTransfer-Encoding: chunked\n\n0\\r\\n\n\\r\\n\nG...      <- a front proxy and the backend disagree on where the body ends\n```\nIf a proxy uses one header and the backend uses the other, the leftover bytes are read as the **start of a second, hidden request**. This is **HTTP request smuggling**, and the lecture's code demo produced two responses for one request.\n\n### Header character restrictions\nThe RFC excludes certain characters from header values, so you can't put raw JSON with braces and quotes into a cookie. That's why tokens such as **JWTs are Base64url-encoded**. (A JWT starts `eyJ`, which is Base64 for `{\"`.) A protocol choice has to work across the whole stack: TCP happily carries binary, but the HTTP header layer doesn't.\n\n### RFC structure\nHTTP/1.1 was split into six documents in 2014 (RFC 7230–7235: messaging, semantics, conditional requests, range, caching, auth). The instructor called this the \"microservices pattern for RFCs\": the caching people can change their document without touching the range-request document. In 2022, RFC 9110 and 9111 moved the shared semantics and caching rules up a level, with per-version wire formats in separate RFCs (9112 for 1.1, 9113 for 2, 9114 for 3). Read the conditional-request and caching parts. **Fun fact:** **418 I'm a teapot** came from an April Fools RFC (2324), and many sites implement it. RFC 9110 reserves the code so nothing else can use it."
+  },
+  {
+   "heading": "Head-of-line blocking in HTTP/1.1, header bloat and Nagle",
+   "body": "### HTTP-level head-of-line (HOL) blocking\nWith **pipelining**, a 1.1 client may send several requests back-to-back on one connection, but **responses must come back in request order**. There is **no request identifier**: the order *is* the identifier. If request 1 is slow (say a recommendation engine) and requests 2–6 are static files, all of them wait behind request 1. A client bug in matching responses to requests could hand an image request a JSON response. Redis pipelining works the same way. **Solution: multiplexing with IDs.** Tag every chunk with a request or stream ID so responses can be interleaved and arrive out of order.\n\nThe same idea of multiplexing by ID shows up everywhere: TCP ports, SS7 transaction IDs, **FastCGI request IDs**, `select()` multiplexing many file descriptors, and HTTP/2 and HTTP/3 **stream IDs**.\n\n### Header bloat\nEven a body-less conditional request carries about **800 bytes** of headers (user-agent, cookies, accept-*), and they're **almost identical on every request**. This hurt badly on **ADSL**, where upload speed was about 1/6 of download speed. The lecture asked \"why not gzip?\" and answered it under HTTP/2.\n\n### Nagle's algorithm + delayed ACK\n- **Nagle:** don't send a small segment while an earlier one is still unacknowledged. Buffer until an ACK arrives or a full MSS accumulates.\n- **Delayed ACK:** don't ACK immediately. Wait a little in case the ACK can piggyback on data.\n- Combined: the client writes its headers, then wants to write a small body. Nagle holds the body until the headers are ACKed, while the server delays the ACK because it's waiting for the full request. Both sides wait, and every request after the first stalls for about **40 ms** (the Linux delayed-ACK timer; some stacks use 200 ms).\n- **Fix:** set the **`TCP_NODELAY`** socket option, which disables Nagle. Practically every HTTP server does. This only shows up on persistent connections, which 1.1 introduced.\n\n### Why move from 1.1 to 2 (a favourite interview question)\nHOL blocking, header bloat, too many connections (each one costs memory and a handshake, as we saw with fork/select), and ambiguous text framing (the CL vs TE mess)."
+  },
+  {
+   "heading": "HTTP/2: SPDY, connection preface and binary framing",
+   "body": "**SPDY** came from Google around 2009. Its blog claimed pages loaded up to **55% faster** in lab tests on 25 top sites, and it shipped widely from about 2010 to 2014. HTTP/2 is essentially SPDY standardised (RFC 7540, 2015, now RFC 9113), and SPDY was then removed. Lesson: **if you own both ends** (Chrome plus Google's servers), you can fix a protocol and prove it works. There will be no HTTP/2.1. The next version is 3.\n\n### Connection preface\n```\nPRI * HTTP/2.0\\r\\n\\r\\nSM\\r\\n\\r\\n      (24 octets, hex 50 52 49 ...)\n```\n`PRI` is not a valid 1.x method. An HTTP/2 server recognises it, while a 1.x server rejects it with an error such as 405 or 501 instead of misreading it. The joke is that \"PRI ... SM\" spells **PRISM**, the NSA surveillance programme from the 2013 Snowden leaks. Reusing something old to mean something new is a standard way to design an upgrade.\n\n### Negotiating h2\n- **ALPN** (Application-Layer Protocol Negotiation) runs inside the TLS handshake: the client offers `h2`, `http/1.1` and the server picks one, with no extra round trip.\n- **h2c** is cleartext HTTP/2. The old `Upgrade: h2c` path from 1.1 was removed in RFC 9113. **Browsers only speak HTTP/2 over TLS**, which makes debugging harder.\n\n### Frame header: always 9 bytes\n```\n+-----------------------------------------------+\n|              Length (24 bits)                 |\n+---------------+---------------+---------------+\n|  Type (8)     |  Flags (8)    |\n+-+-------------+---------------+---------------+\n|R|         Stream Identifier (31 bits)         |\n+-+---------------------------------------------+\n|              Frame Payload (Length bytes)     |\n```\n- 3 + 1 + 1 + 4 = **9 bytes** of overhead on every frame. A response is split into frame header + payload, repeated as needed.\n- **Streams:** client-initiated streams use **odd** IDs (1, 3, 5...), server-initiated (push) streams use **even** IDs, and **stream 0** is for connection-level frames such as SETTINGS, PING and GOAWAY. Splitting odd and even avoids ID collisions.\n- **Frame types:** DATA (0x0), HEADERS (0x1), PRIORITY, RST_STREAM (cancel one stream), SETTINGS (0x4), PUSH_PROMISE, PING, GOAWAY, WINDOW_UPDATE, CONTINUATION. A typical hex dump looks like: preface, SETTINGS on stream 0, HEADERS on stream 1, DATA on stream 1, and so on.\n- **Fixed-width headers that describe variable-length payloads** are the core design pattern, much like type-length-value (TLV) encoding. ASN.1 goes further and lets the type define the length."
+  },
+  {
+   "heading": "HTTP/2: multiplexing, HPACK and server push",
+   "body": "### Multiplexing\nSix requests go out **at the same time on one connection**, and frames from different responses are **interleaved**: response 1, 2, 3, 1... Whichever is ready goes first. In the lecture's example, five fast responses no longer wait about 2,000 ms for one slow one. This is like **preemptive multitasking** for responses, and perceived page speed improves a lot. The cost:\n- **Assembly:** the server and client must reassemble frames per stream into logical requests and responses.\n- **Isolation:** stream 1's data must never leak into stream 2, and a slow stream must not stall the others.\n- A binary protocol is efficient but **hard to debug**, the same trade-off as JSON versus Protocol Buffers (protobuf encode/decode is about 35–65% faster, FlatBuffers faster still).\n\n### HPACK header compression\n- A **static table of 61** common header entries (`:method GET`, `:path /`, `accept-encoding`...) shared by both sides, so an entry is sent as a small **index**.\n- A **dynamic table** that both sides build as the connection goes on, so repeated custom headers and cookies also become indexes.\n- **Huffman coding** for literal strings.\n- **Why not just gzip the headers?** Headers carry secrets such as cookies and JWTs. With generic compression, the **compressed length leaks information about the secret** (the **CRIME** attack). HPACK's index-based scheme limits that leak.\n\n### Server push (now effectively dead)\nThe server could send resources before the client asked, using PUSH_PROMISE. In practice the server doesn't know what the client already has cached, and only about **1.25%** of HTTP/2 sites used it, so browsers dropped it. The instructor liked the idea, for example pushing only the changed bytes of a live cricket scorecard (JSON diff), but the server needs to know the client's last state to do that.\n\n**Penalty of HTTP/2:** 9 bytes per frame, plus implementation complexity. One frame can carry up to 2^24−1 bytes, but by default it carries at most 16,384 until SETTINGS raises the limit."
+  },
+  {
+   "heading": "TCP head-of-line blocking and why HTTP/3 uses QUIC over UDP",
+   "body": "HTTP/2 removed HTTP-level HOL blocking, but **TCP-level HOL blocking remains**. TCP is one ordered byte stream and doesn't know about HTTP/2 streams. If one packet carrying stream 1 is lost, the kernel holds **every later byte** in the receive buffer until the retransmission arrives, because TCP promises in-order delivery. Streams 2 and 3 stall for no reason, and memory fills up while they wait.\n\n### Why UDP and not a new transport protocol\nThe IP header has a protocol-number field (TCP = 6, UDP = 17, and **SCTP** = 132, which supports multi-homing and was used for SIGTRAN in telecom). But routers, NATs, firewalls and load balancers worldwide (billions to trillions of dollars of hardware) only handle TCP and UDP. **We are stuck with IP, and TCP can only be replaced by building on UDP.** UDP was chosen because it was available, not because it's fancy.\n\n### QUIC design choices\n- **Encryption is mandatory.** TLS 1.3 is built in, and there is no unencrypted QUIC. Almost all headers are encrypted too, so middleboxes can't read fields and build assumptions on them (DNS-over-UDP length assumptions froze that protocol). This keeps the protocol **able to evolve** and avoids ossification.\n- **Fewer round trips:** the transport and crypto handshakes are combined.\n\n| Stack | RTTs before the request can be sent | RTTs to first response byte |\n|---|---|---|\n| TCP + TLS 1.2 | 3 | 4 |\n| TCP + TLS 1.3 | 2 | 3 |\n| QUIC (new connection) | 1 | 2 |\n| QUIC 0-RTT resumption | 0 | 1 |\n\n- **Independent streams:** each STREAM frame carries a stream ID. A lost packet delays only the streams whose data it carried, and others continue.\n- **User space:** QUIC is implemented in the application or library, not the kernel, so it can be updated quickly. It has its own retries, and TCP SYN cookies don't apply.\n- **Connection migration:** a connection is identified by a **connection ID**, not the 4-tuple (IP:port pairs), so it survives a switch between Wi-Fi and mobile data.\n- **QPACK** replaces HPACK. HPACK's dynamic table needed in-order delivery, a HOL problem of its own: \"HPACK created it, QPACK fixed it.\"\n\n### Discovery and fallback\n- `Alt-Svc: h3=\":443\"` response header, ALPN `h3` in TLS, or the **DNS HTTPS record (type 65)**, which can advertise h3 before you connect at all.\n- Some networks block or throttle UDP. Clients then **fall back to TCP** (HTTP/2 or 1.1). A small share of users, a few percent, can't use UDP.\n- Adoption is still partial after more than 10 years of HTTP/2. HTTP/1.1 still carries a noticeable share of traffic, and the HTTP/3 share depends on how you measure it. Firewalls that allow only TCP 80/443 slow adoption.\n- **Cost:** everything is encrypted, even public content like your logo.\n\n### Big-picture lessons\n- **Multiplexing everywhere:** `select()` multiplexes file descriptors, TCP multiplexes ports, SS7 and FastCGI use transaction or request IDs, and HTTP/2 and 3 use stream IDs.\n- Every time something is used heavily, new limits appear. Examples are the C10K problem (10,000 concurrent connections) and RAM per connection, and each one leads to the next design.\n- **Easy wins first:** text HTTP/1 won because it was easy to understand, debug and implement. Binary efficiency comes later.\n- **The best standard is not always the most popular**, because upgrades take years.\n- Splitting a spec into separately evolving documents (RFC 7230–7235, 9110–9114) lets each concern change independently.\n- Tools: the lecture repo has Python demos for HTTP/1.0 vs 1.1 timing, headers.py for header sizes, pipelining, Nagle delay, HTTP/2 hex dumps and HPACK. Wireshark and tcpdump can show the same things. Be careful with **iptables** on remote machines: you can drop your own SSH connection."
+  },
+  {
+   "heading": "Quick revision",
+   "body": "- HTTP/1.0 = RFC 1945 (1996). Methods GET, HEAD, POST. Server closes the connection after each response.\n- No Host header in 1.0, so no virtual hosting. 1.1 makes Host mandatory (400 if missing). TLS equivalent: SNI. HTTP/2 equivalent: `:authority`.\n- Last-Modified + If-Modified-Since → 304. Saves bytes, not round trips. Problems: clock skew, 1 s granularity.\n- ETag + If-None-Match → 304. If-Match on writes → 412 on mismatch. Weak ETag = `W/`.\n- Cache-Control: max-age, no-cache (revalidate every time), no-store (never store).\n- Vary: listed request headers become part of the cache key. Vary: User-Agent or Cookie kills the hit ratio.\n- Range → 206 Partial Content. Invalid range → 416. Used for resume and video seek.\n- Chunked: hex length + data per chunk, ends with a 0-length chunk. Used when the total size is unknown (LLM streaming).\n- 1.1 persistent by default. `Connection: close` to end it.\n- RFC 2616 said at most 2 connections per server. Browsers use about 6 per host. Sharding: 3 domains × 6 = 18.\n- Pipelining = responses in order, no IDs, so HTTP HOL blocking.\n- Nagle + delayed ACK ≈ 40 ms stall. Fix with TCP_NODELAY.\n- Both CL and TE present → TE wins. Disagreement between hops enables request smuggling.\n- HTTP/2 = SPDY standardised. RFC 7540 → 9113. Preface `PRI * HTTP/2.0\\r\\n\\r\\nSM\\r\\n\\r\\n` (24 bytes).\n- Frame header 9 bytes: length 24 bits, type 8, flags 8, R 1, stream ID 31. Client streams odd, server even, stream 0 = connection.\n- HPACK: 61-entry static table, dynamic table, Huffman. Not gzip because of CRIME (compressed length leaks secrets).\n- Server push deprecated (about 1.25% use).\n- HTTP/2 still has TCP-level HOL blocking. HTTP/3/QUIC over UDP fixes it per stream.\n- QUIC: mandatory TLS 1.3, 1-RTT new connections, 0-RTT resumption, connection IDs allow migration, user space, QPACK.\n- h3 discovery: Alt-Svc, ALPN, DNS HTTPS record type 65. Falls back to TCP if UDP is blocked."
+  },
+  {
+   "heading": "Exam traps",
+   "body": "- **HTTP/1.0 HOL blocking:** strictly there isn't any at the HTTP level, because each request has its own connection. HOL blocking needs a persistent, pipelined connection (1.1).\n- **HTTP/2 did not remove all HOL blocking.** It removed the HTTP-level kind. TCP-level HOL blocking stays until QUIC.\n- **`no-cache` ≠ \"don't cache\".** It means \"store it, but revalidate before every use\". `no-store` means never store.\n- **304 vs 200:** a conditional request still costs a round trip. Only the body is saved.\n- **206 is the success code for ranges.** 416 is for an unsatisfiable range. Don't confuse either with 204 No Content.\n- **SYN cookies are TCP-level**, not TLS.\n- **QUIC is not \"unencrypted UDP\".** TLS 1.3 is mandatory inside it.\n- **h2c exists in the spec, but browsers don't use it.** In practice, browser HTTP/2 always runs over TLS with ALPN `h2`.\n- **The stream ID is 31 bits**, not 32 (1 reserved bit), and the frame length field is 24 bits.\n- **Domain sharding helps HTTP/1.1 but hurts HTTP/2**, because it means extra connections and handshakes and splits the HPACK context.\n- **When CL and TE conflict, Transfer-Encoding wins.** Content-Length is ignored. Don't apply \"be liberal\" here.\n- **Vary is about request headers.** It lists *request* headers whose values select the variant, not response headers.\n- **ETag is not tied to time.** It's a version or content identifier, so clock skew doesn't affect it.\n- **The Nagle stall is milliseconds (about 40 ms), not seconds**, and it needs a persistent connection."
+  }
+ ],
+ "keyTerms": [
+  {
+   "term": "RFC",
+   "def": "Request For Comments: an IETF document proposing or defining an Internet standard (e.g. RFC 1945 = HTTP/1.0)."
+  },
+  {
+   "term": "Persistent connection",
+   "def": "Reusing one TCP connection for many HTTP requests; the default in HTTP/1.1 unless `Connection: close`."
+  },
+  {
+   "term": "Host header",
+   "def": "Request header naming the target site, enabling many virtual hosts on one IP; mandatory in HTTP/1.1."
+  },
+  {
+   "term": "Virtual host (vhost)",
+   "def": "One server/IP serving multiple sites, selected by the Host header (or SNI for TLS)."
+  },
+  {
+   "term": "SNI",
+   "def": "Server Name Indication: the hostname sent in the TLS ClientHello so the server can choose the right certificate."
+  },
+  {
+   "term": "If-Modified-Since",
+   "def": "Conditional request header using a timestamp; server replies 304 if the resource is unchanged."
+  },
+  {
+   "term": "ETag",
+   "def": "Opaque version identifier of a resource (often a hash); used with If-None-Match / If-Match."
+  },
+  {
+   "term": "304 Not Modified",
+   "def": "Response to a successful conditional GET: use your cached copy, no body is sent."
+  },
+  {
+   "term": "Cache-Control",
+   "def": "HTTP/1.1 header controlling caching: max-age, no-cache (revalidate), no-store (never store), etc."
+  },
+  {
+   "term": "Vary",
+   "def": "Response header listing request headers whose values change the response; they become part of the cache key."
+  },
+  {
+   "term": "Range request",
+   "def": "Request for part of a resource (`Range: bytes=a-b`); answered with 206 Partial Content."
+  },
+  {
+   "term": "Chunked transfer encoding",
+   "def": "Body sent as length-prefixed chunks ending with a zero-length chunk; no total length needed upfront."
+  },
+  {
+   "term": "Pipelining",
+   "def": "Sending several HTTP/1.1 requests without waiting; responses must return in the same order."
+  },
+  {
+   "term": "Head-of-line blocking",
+   "def": "One slow or lost item at the front of an ordered queue delays everything behind it."
+  },
+  {
+   "term": "Domain sharding",
+   "def": "Spreading assets across several hostnames to get more parallel HTTP/1.x connections."
+  },
+  {
+   "term": "Postel's law",
+   "def": "Be conservative in what you send, liberal in what you accept."
+  },
+  {
+   "term": "Request smuggling",
+   "def": "Attack exploiting disagreement between hops about where a request ends (e.g. Content-Length vs Transfer-Encoding)."
+  },
+  {
+   "term": "Nagle's algorithm",
+   "def": "TCP holds small segments while earlier data is unacknowledged; disabled with TCP_NODELAY."
+  },
+  {
+   "term": "SPDY",
+   "def": "Google's experimental protocol that became the basis of HTTP/2."
+  },
+  {
+   "term": "ALPN",
+   "def": "TLS extension to negotiate the application protocol (h2, http/1.1, h3) during the handshake."
+  },
+  {
+   "term": "HTTP/2 frame",
+   "def": "Unit of HTTP/2 data: 9-byte header (24-bit length, type, flags, 31-bit stream ID) + payload."
+  },
+  {
+   "term": "Stream",
+   "def": "An independent request/response exchange inside one HTTP/2 or QUIC connection, identified by a stream ID."
+  },
+  {
+   "term": "HPACK",
+   "def": "HTTP/2 header compression: 61-entry static table, dynamic table and Huffman coding."
+  },
+  {
+   "term": "CRIME",
+   "def": "Attack that recovers secrets (cookies) from the size of compressed data; why HTTP/2 avoided gzip for headers."
+  },
+  {
+   "term": "Server push",
+   "def": "HTTP/2 feature letting the server send unrequested resources; effectively abandoned."
+  },
+  {
+   "term": "QUIC",
+   "def": "UDP-based, always-encrypted transport with independent streams and 1-RTT/0-RTT setup; carries HTTP/3."
+  },
+  {
+   "term": "QPACK",
+   "def": "HTTP/3's header compression, redesigned to avoid HPACK's head-of-line blocking."
+  },
+  {
+   "term": "Alt-Svc",
+   "def": "Response header advertising an alternative protocol/endpoint, e.g. `h3=\":443\"`."
+  },
+  {
+   "term": "SCTP",
+   "def": "Transport protocol (IP protocol 132) with multi-homing; used in telecom but blocked on the public Internet."
+  }
+ ],
+ "mcqs": [
+  {
+   "q": "Which set of methods did HTTP/1.0 (RFC 1945) define as its core methods?",
+   "options": [
+    "GET, HEAD, POST",
+    "GET, POST, PUT, DELETE",
+    "GET, POST, OPTIONS",
+    "GET, HEAD, OPTIONS, TRACE"
+   ],
+   "answer": 0,
+   "explanation": "RFC 1945 defines only GET, HEAD and POST as core methods. PUT, DELETE, LINK and UNLINK appear only as 'additional' methods in an appendix.",
+   "distractors": "OPTIONS and TRACE came with HTTP/1.1, and PUT/DELETE were not core 1.0 methods.",
+   "source": "lecture",
+   "id": "L05-m1"
+  },
+  {
+   "q": "A single IP address hosts shop.com and blog.com. What lets an HTTP/1.1 server decide which site a plaintext request is for?",
+   "options": [
+    "The destination port",
+    "The User-Agent header",
+    "The Host header",
+    "The Via header"
+   ],
+   "answer": 2,
+   "explanation": "HTTP/1.1 made the Host header mandatory precisely so one IP can serve many virtual hosts. Over TLS the same job is done earlier by SNI.",
+   "distractors": "Both sites usually share port 80, User-Agent describes the client, and Via lists proxies.",
+   "source": "lecture",
+   "id": "L05-m2"
+  },
+  {
+   "q": "A browser sends `If-Modified-Since` and the file has not changed. What does a compliant server return?",
+   "options": [
+    "200 OK with an empty body",
+    "304 Not Modified with no body",
+    "204 No Content",
+    "412 Precondition Failed"
+   ],
+   "answer": 1,
+   "explanation": "A successful conditional GET returns 304 Not Modified with no body, telling the client to use its cached copy. A round trip still happens, but the body is not re-sent.",
+   "distractors": "204 is for responses that intentionally have no content, and 412 is for a failed If-Match on writes.",
+   "source": "lecture",
+   "id": "L05-m3"
+  },
+  {
+   "q": "Which is NOT a weakness of Last-Modified/If-Modified-Since compared with ETags?",
+   "options": [
+    "Client and server clocks can be skewed",
+    "It has only one-second granularity",
+    "A timestamp does not identify content",
+    "It requires the server to compute a hash of the body"
+   ],
+   "answer": 3,
+   "explanation": "Timestamps suffer from clock skew, 1-second resolution and a lack of content identity. Computing a hash is a cost of ETags, not of Last-Modified.",
+   "distractors": "The other three options are exactly the problems the lecture listed for timestamp validation.",
+   "source": "lecture",
+   "id": "L05-m4"
+  },
+  {
+   "q": "A CDN caches `/app.js`. The origin responds with `Vary: Accept-Encoding`. What changes?",
+   "options": [
+    "Nothing; Vary only affects browsers",
+    "The CDN must never cache the file",
+    "The value of Accept-Encoding becomes part of the cache key, so gzip, br and identity variants are stored separately",
+    "The CDN must always store the uncompressed version only"
+   ],
+   "answer": 2,
+   "explanation": "Vary tells every cache that the response depends on the named request headers, so their values join the cache key. A gzip copy must not be served to a client that didn't accept gzip.",
+   "distractors": "Vary applies to all caches (proxies, CDNs, browsers), and it doesn't forbid caching (only `Vary: *` effectively does).",
+   "source": "lecture",
+   "id": "L05-m5"
+  },
+  {
+   "q": "A client sends `Range: bytes=0-99` for a 10 KB file and the server supports ranges. Which status code is returned?",
+   "options": [
+    "206 Partial Content",
+    "200 OK",
+    "416 Range Not Satisfiable",
+    "202 Accepted"
+   ],
+   "answer": 0,
+   "explanation": "A satisfied range request returns 206 Partial Content with a Content-Range header. 416 is only for ranges that can't be served, such as past the end of the file.",
+   "distractors": "200 would mean the full body, and 202 means accepted for later processing.",
+   "source": "lecture",
+   "id": "L05-m6"
+  },
+  {
+   "q": "In `Transfer-Encoding: chunked`, how does the receiver know the body has ended?",
+   "options": [
+    "The server closes the TCP connection",
+    "A Content-Length trailer is sent",
+    "A blank line follows the last data chunk",
+    "A chunk with length 0 is received"
+   ],
+   "answer": 3,
+   "explanation": "Each chunk is prefixed with its size in hex, and a zero-length chunk (`0\\r\\n\\r\\n`) marks the end. That's why the connection can stay open and the total size never needs to be known.",
+   "distractors": "Closing the connection was the 1.0 approach, and a blank line alone ends only the header section.",
+   "source": "lecture",
+   "id": "L05-m7"
+  },
+  {
+   "q": "Six requests are pipelined on one HTTP/1.1 connection and the first takes 2 s while the others are instant. What happens?",
+   "options": [
+    "Responses 2–6 arrive immediately and response 1 arrives last",
+    "All six responses wait about 2 s because responses must come back in request order",
+    "The server opens five new connections automatically",
+    "The client cancels request 1 using RST_STREAM"
+   ],
+   "answer": 1,
+   "explanation": "HTTP/1.1 responses carry no request ID, so order is the only identifier, and a slow first response blocks the rest. This is HTTP-level head-of-line blocking.",
+   "distractors": "Out-of-order delivery and RST_STREAM are HTTP/2 features, and servers don't open connections back to clients.",
+   "source": "lecture",
+   "id": "L05-m8"
+  },
+  {
+   "q": "A persistent-connection client sees a ~40 ms delay on every request after the first, when it writes the headers and body in two small writes. What is the standard fix?",
+   "options": [
+    "Switch to HTTP/1.0",
+    "Increase the TCP receive window",
+    "Set TCP_NODELAY to disable Nagle's algorithm",
+    "Enable SYN cookies"
+   ],
+   "answer": 2,
+   "explanation": "Nagle's algorithm holds the small body until the headers are ACKed, while the peer delays the ACK. TCP_NODELAY disables Nagle so the small segment goes out immediately.",
+   "distractors": "The window size and SYN cookies don't affect this interaction, and going back to 1.0 just swaps the stall for a handshake per request.",
+   "source": "lecture",
+   "id": "L05-m9"
+  },
+  {
+   "q": "What is the size of an HTTP/2 frame header, and how many bits is the stream identifier?",
+   "options": [
+    "9 bytes, 31-bit stream ID",
+    "8 bytes, 32-bit stream ID",
+    "9 bytes, 24-bit stream ID",
+    "12 bytes, 31-bit stream ID"
+   ],
+   "answer": 0,
+   "explanation": "The header is 24-bit length + 8-bit type + 8-bit flags + 1 reserved bit + 31-bit stream ID = 9 bytes.",
+   "distractors": "24 bits is the length field, not the stream ID, and the header has no 12-byte or 32-bit-ID form.",
+   "source": "lecture",
+   "id": "L05-m10"
+  },
+  {
+   "q": "In HTTP/2, which stream IDs does a client use for the requests it initiates?",
+   "options": [
+    "Even numbers starting at 2",
+    "Stream 0 only",
+    "Any number chosen at random",
+    "Odd numbers starting at 1"
+   ],
+   "answer": 3,
+   "explanation": "Client-initiated streams are odd (1, 3, 5...), server-initiated (push) streams are even, and stream 0 is reserved for connection-level frames such as SETTINGS. The split prevents ID collisions.",
+   "distractors": "Stream 0 can't carry a request, and random IDs would collide (IDs must also increase).",
+   "source": "lecture",
+   "id": "L05-m11"
+  },
+  {
+   "q": "Why did HTTP/2 design HPACK instead of simply gzip-compressing the headers?",
+   "options": [
+    "gzip cannot compress ASCII text",
+    "Generic compression leaks secrets like cookies through the compressed size (the CRIME attack)",
+    "gzip is patented",
+    "Headers are already compressed by TLS"
+   ],
+   "answer": 1,
+   "explanation": "Headers carry cookies and tokens. With DEFLATE-style compression, an attacker who can inject guesses can read the secret from changes in compressed length. HPACK uses static and dynamic indexing plus Huffman coding, which limits that leak.",
+   "distractors": "gzip compresses text very well, isn't patented, and TLS compression was disabled for the same CRIME reason.",
+   "source": "lecture",
+   "id": "L05-m12"
+  },
+  {
+   "q": "An HTTP/2 connection loses one TCP packet carrying data for stream 1. What happens to streams 3 and 5?",
+   "options": [
+    "Nothing; HTTP/2 streams are independent at every layer",
+    "They are re-sent on a new connection",
+    "They also stall, because TCP delivers bytes strictly in order and holds later data until the lost packet is retransmitted",
+    "They are dropped and must be re-requested"
+   ],
+   "answer": 2,
+   "explanation": "TCP doesn't know about HTTP/2 streams. It buffers everything after the gap until the retransmission arrives, which is TCP-level head-of-line blocking. QUIC fixes this with per-stream ordering.",
+   "distractors": "Streams are independent only at the HTTP layer, and no data is dropped or re-requested.",
+   "source": "lecture",
+   "id": "L05-m13"
+  },
+  {
+   "q": "Why is QUIC built on top of UDP rather than as a new IP-level transport protocol, as SCTP is?",
+   "options": [
+    "Middleboxes (NATs, firewalls, load balancers) worldwide only pass TCP and UDP, so a new protocol number would be blocked",
+    "UDP is inherently more reliable than TCP",
+    "UDP packets are encrypted by default",
+    "The IP header has no protocol field for new transports"
+   ],
+   "answer": 0,
+   "explanation": "The installed base of hardware ossified the Internet around TCP and UDP. Building on UDP and doing reliability in user space was the deployable option.",
+   "distractors": "UDP is unreliable and unencrypted, and the IP protocol field exists (SCTP = 132) but such packets get dropped.",
+   "source": "lecture",
+   "id": "L05-m14"
+  },
+  {
+   "q": "A request carries both `Content-Length: 6` and `Transfer-Encoding: chunked`. What does the HTTP/1.1 spec require?",
+   "options": [
+    "Use Content-Length and ignore Transfer-Encoding",
+    "Use whichever header appears first",
+    "Concatenate both bodies",
+    "Transfer-Encoding takes precedence and Content-Length must be ignored (or the message rejected)"
+   ],
+   "answer": 3,
+   "explanation": "The RFC says Transfer-Encoding overrides Content-Length, and such messages are suspicious. If two hops disagree, the leftover bytes become a smuggled request.",
+   "distractors": "Header order doesn't matter, and preferring Content-Length is exactly the disagreement that enables smuggling.",
+   "source": "lecture",
+   "id": "L05-m15"
+  },
+  {
+   "q": "With RTT = 100 ms, roughly how long until the first response byte on a brand-new HTTPS connection using TCP + TLS 1.3 (ignoring server processing)?",
+   "options": [
+    "100 ms",
+    "200 ms",
+    "300 ms",
+    "400 ms"
+   ],
+   "answer": 2,
+   "explanation": "TCP handshake (1 RTT) + TLS 1.3 handshake (1 RTT) + request/response (1 RTT) = 3 RTT = 300 ms. QUIC combines the first two, giving 2 RTT.",
+   "distractors": "200 ms is the QUIC new-connection figure, and 400 ms corresponds to TLS 1.2.",
+   "source": "lecture",
+   "id": "L05-m16"
+  },
+  {
+   "q": "A browser allows 6 connections per hostname. A site shards images across img1, img2 and img3.example.com. How many parallel image connections can the browser open?",
+   "options": [
+    "6",
+    "18",
+    "2",
+    "36"
+   ],
+   "answer": 1,
+   "explanation": "Connection limits are per hostname, so 3 shards × 6 = 18. This is why domain sharding was popular under HTTP/1.x.",
+   "distractors": "2 was the old RFC 2616 suggestion, and 36 double-counts.",
+   "source": "lecture",
+   "id": "L05-m17"
+  },
+  {
+   "q": "Which mechanism lets a client learn that a site supports HTTP/3 before opening any connection to it?",
+   "options": [
+    "The Alt-Svc response header",
+    "ALPN in the TLS handshake",
+    "The Upgrade: h2c header",
+    "A DNS HTTPS (type 65) record"
+   ],
+   "answer": 3,
+   "explanation": "The HTTPS/SVCB DNS record (type 65) can advertise `alpn=h3`, so the client can use QUIC right away.",
+   "distractors": "Alt-Svc and ALPN both need a connection first, and h2c is cleartext HTTP/2, not HTTP/3.",
+   "source": "lecture",
+   "id": "L05-m18"
+  },
+  {
+   "q": "Which statement is Postel's law (the robustness principle)?",
+   "options": [
+    "Be conservative in what you send, liberal in what you accept",
+    "Be liberal in what you send, conservative in what you accept",
+    "Always reject messages that are not strictly valid",
+    "Never change a deployed protocol"
+   ],
+   "answer": 0,
+   "explanation": "Senders should emit the most standard form, while receivers tolerate variation. This matters during version upgrades, when the server must accept old and new clients.",
+   "distractors": "Option B reverses the principle, and strict rejection is the deliberate exception made for CL+TE.",
+   "source": "lecture",
+   "id": "L05-m19"
+  }
+ ],
+ "short": [
+  {
+   "q": "Explain why loading a page with 40 small resources was slow over HTTP/1.0, and what HTTP/1.1 changed to fix it.",
+   "checks": [
+    {
+     "label": "States 1.0 closes the connection after each response",
+     "patterns": [
+      "clos"
+     ]
+    },
+    {
+     "label": "Mentions the cost of the TCP/TLS handshake (round trips)",
+     "patterns": [
+      "handshake",
+      "round.?trip",
+      "\\brtt"
+     ]
+    },
+    {
+     "label": "Names persistent / keep-alive connections in 1.1",
+     "patterns": [
+      "persistent",
+      "keep.?alive"
+     ]
+    },
+    {
+     "label": "Mentions reuse of one connection for many requests",
+     "patterns": [
+      "reuse",
+      "same connection",
+      "one connection",
+      "single connection"
+     ]
+    }
+   ],
+   "modelAnswer": "In HTTP/1.0 the server closes the TCP connection after every response, so each of the 40 resources needs a new connection. Every new connection pays the TCP handshake (1 RTT), plus a TLS handshake for HTTPS, before the request can even be sent. For small files like CSS, the handshake round trips cost as much as the transfer itself.\nHTTP/1.1 made persistent connections the default (keep-alive unless `Connection: close`), so the browser can reuse the same connection for many requests and pay the handshake only once. It also allowed pipelining, and browsers open a few parallel connections (about 6 per host).",
+   "explanation": "The examiner wants the cause (a new connection and handshake per request because the server closes) and the fix (persistent connections reused by default in 1.1).",
+   "id": "L05-s1"
+  },
+  {
+   "q": "Compare Last-Modified/If-Modified-Since with ETag/If-None-Match for cache validation. Why are ETags generally preferred, and what cost do both still have?",
+   "checks": [
+    {
+     "label": "Mentions 304 Not Modified",
+     "patterns": [
+      "304"
+     ]
+    },
+    {
+     "label": "Mentions clock skew/drift or time granularity problem",
+     "patterns": [
+      "clock",
+      "skew",
+      "drift",
+      "granularit",
+      "one.?second"
+     ]
+    },
+    {
+     "label": "Explains ETag as a version/content identifier or hash",
+     "patterns": [
+      "hash",
+      "version",
+      "identif",
+      "fingerprint"
+     ]
+    },
+    {
+     "label": "Notes a request/round trip still happens (saves bytes not requests)",
+     "patterns": [
+      "round.?trip",
+      "still.*request",
+      "request still",
+      "bandwidth",
+      "bytes"
+     ]
+    }
+   ],
+   "modelAnswer": "Both are conditional requests. The client sends the validator it has, and if the resource is unchanged the server replies 304 Not Modified with no body.\nLast-Modified uses a timestamp. Client and server clocks can be skewed or drift, the granularity is one second (two edits in the same second look identical), and a timestamp (mtime) doesn't identify the content itself.\nAn ETag is an opaque version identifier, often a hash of the content, so it doesn't depend on clocks and changes exactly when the content changes. If-Match can also protect writes (412 on mismatch).\nBoth still cost a full round trip per check: they save bandwidth and bytes, not requests. Only max-age/Expires avoid the request entirely.",
+   "explanation": "Look for the 304 mechanism, the specific timestamp weaknesses, ETag as a content or version identifier, and the point that validation still costs a round trip.",
+   "id": "L05-s2"
+  },
+  {
+   "q": "Describe head-of-line blocking in (a) HTTP/1.1 pipelining, (b) HTTP/2 over TCP, and explain (c) how HTTP/3 removes it.",
+   "checks": [
+    {
+     "label": "1.1: responses must be returned in request order",
+     "patterns": [
+      "order"
+     ]
+    },
+    {
+     "label": "HTTP/2: multiplexing / stream IDs",
+     "patterns": [
+      "stream id",
+      "multiplex",
+      "stream identifier"
+     ]
+    },
+    {
+     "label": "HTTP/2 still blocked by a lost TCP packet",
+     "patterns": [
+      "packet loss",
+      "lost packet",
+      "loses? (a |one )?packet",
+      "retransmi"
+     ]
+    },
+    {
+     "label": "HTTP/3 uses QUIC over UDP",
+     "patterns": [
+      "quic",
+      "udp"
+     ]
+    },
+    {
+     "label": "Streams are delivered independently in QUIC",
+     "patterns": [
+      "independent",
+      "other streams",
+      "only (that|the affected) stream",
+      "per.?stream"
+     ]
+    }
+   ],
+   "modelAnswer": "(a) In HTTP/1.1 pipelining, requests can be sent back-to-back, but responses carry no ID, so they must be returned in request order. One slow response (say 2 s of processing) blocks every response queued behind it.\n(b) HTTP/2 multiplexes many streams over one TCP connection. Each 9-byte frame header carries a 31-bit stream ID, so responses can be interleaved and finish out of order, which removes HTTP-level blocking. But TCP is a single ordered byte stream: if one packet is lost, the kernel holds all later bytes until the retransmission arrives, so every stream stalls. That's TCP-level HOL blocking.\n(c) HTTP/3 runs on QUIC over UDP. QUIC itself provides streams with per-stream ordering, so a lost packet delays only the stream whose data it carried, and the other streams continue independently. QPACK also replaces HPACK to avoid header-table blocking.",
+   "explanation": "All three layers are needed: ordering without IDs in 1.1, the TCP packet-loss stall in HTTP/2, and independent QUIC streams in HTTP/3.",
+   "id": "L05-s3"
+  },
+  {
+   "q": "Decode this HTTP/2 frame header (hex): `00 00 0C 01 05 00 00 00 03`. Give the payload length, frame type, flags meaning and stream ID, and say who initiated the stream.",
+   "checks": [
+    {
+     "label": "Length = 12 bytes",
+     "patterns": [
+      "\\b12\\b"
+     ]
+    },
+    {
+     "label": "Type = HEADERS (0x1)",
+     "patterns": [
+      "headers"
+     ]
+    },
+    {
+     "label": "Stream ID = 3",
+     "patterns": [
+      "stream (id )?(=|is|:)? ?3\\b",
+      "stream 3",
+      "id 3",
+      "= ?3\\b"
+     ]
+    },
+    {
+     "label": "Odd stream = client-initiated",
+     "patterns": [
+      "client",
+      "odd"
+     ]
+    },
+    {
+     "label": "Flags END_STREAM and END_HEADERS",
+     "patterns": [
+      "end.?stream",
+      "end.?headers"
+     ]
+    }
+   ],
+   "modelAnswer": "The first 3 bytes (00 00 0C) are the 24-bit length = 0x0C = 12 bytes of payload.\nByte 4 (01) is the type = 0x1 = HEADERS.\nByte 5 (05) is the flags = 0x04 END_HEADERS + 0x01 END_STREAM, meaning the whole header block is in this frame and the sender will send no body on this stream (for example, a GET).\nThe last 4 bytes (00 00 00 03) are the reserved bit (0) plus the 31-bit stream ID = 3.\nStream 3 is odd, so it was initiated by the client. Servers use even IDs, and stream 0 is for connection-level frames.",
+   "explanation": "This tests the 9-byte layout (24-bit length, 8-bit type, 8-bit flags, R + 31-bit stream ID) and the odd/even rule.",
+   "id": "L05-s4"
+  },
+  {
+   "q": "What does the Vary header do, and why can `Vary: User-Agent` or `Vary: Cookie` badly hurt a CDN?",
+   "checks": [
+    {
+     "label": "Vary adds request header values to the cache key",
+     "patterns": [
+      "cache key",
+      "part of the key",
+      "key"
+     ]
+    },
+    {
+     "label": "Example with Accept-Encoding / gzip",
+     "patterns": [
+      "accept.?encoding",
+      "gzip",
+      "brotli"
+     ]
+    },
+    {
+     "label": "Many variants / copies are stored",
+     "patterns": [
+      "variant",
+      "copies",
+      "versions"
+     ]
+    },
+    {
+     "label": "Hit ratio drops / cache fragmentation",
+     "patterns": [
+      "hit ratio",
+      "hit rate",
+      "fragment",
+      "miss"
+     ]
+    }
+   ],
+   "modelAnswer": "Vary is a response header listing the request headers that change the response. Every cache (browser, proxy, CDN) must add the values of those headers to the cache key, so URL + header values identify the stored variant. With Vary: Accept-Encoding, the same URL may have identity, gzip, deflate and Brotli variants, and a gzip copy is never served to a client that didn't ask for it.\nUser-Agent and Cookie values are almost unique per user or device, so Vary on them creates thousands of variants of one URL. Each variant must be fetched from the origin separately, so the cache is fragmented, the hit ratio collapses and the origin load rises. (Vary: * effectively disables reuse.)",
+   "explanation": "The key idea is that Vary extends the cache key, with Accept-Encoding as the healthy example and high-cardinality headers destroying the hit ratio.",
+   "id": "L05-s5"
+  },
+  {
+   "q": "Explain HTTP request smuggling using Content-Length and Transfer-Encoding, and how the spec tries to prevent it.",
+   "checks": [
+    {
+     "label": "Mentions Content-Length",
+     "patterns": [
+      "content.?length"
+     ]
+    },
+    {
+     "label": "Mentions Transfer-Encoding chunked",
+     "patterns": [
+      "transfer.?encoding",
+      "chunked"
+     ]
+    },
+    {
+     "label": "Two hops (proxy and backend) disagree on body boundaries",
+     "patterns": [
+      "disagree",
+      "different",
+      "proxy",
+      "front"
+     ]
+    },
+    {
+     "label": "Leftover bytes treated as a hidden second request",
+     "patterns": [
+      "second request",
+      "hidden",
+      "next request",
+      "smuggl"
+     ]
+    },
+    {
+     "label": "Fix: Transfer-Encoding wins / reject such messages",
+     "patterns": [
+      "transfer.?encoding (wins|takes precedence|overrides)",
+      "ignore[sd]? (the )?content.?length",
+      "reject",
+      "close the connection"
+     ]
+    }
+   ],
+   "modelAnswer": "HTTP/1.1 can mark the end of a body with Content-Length or with Transfer-Encoding: chunked. If a request carries both (say Content-Length: 6 and chunked with a `0` terminator followed by more bytes), a front proxy may use one header and the backend the other. The two disagree about where the body ends, so the leftover bytes stay in the connection and the backend reads them as the start of a hidden second request. That smuggled request can bypass proxy security checks or poison responses for other users.\nPrevention: the RFC says Transfer-Encoding takes precedence and Content-Length must be ignored, and such messages should be treated as an error. Servers reject them or close the connection after responding, and proxies normalise them. This is a deliberate exception to Postel's 'be liberal in what you accept'.",
+   "explanation": "The examiner wants both headers, the disagreement between hops, the smuggled second request, and the TE-wins/reject rule.",
+   "id": "L05-s6"
+  },
+  {
+   "q": "How does HPACK reduce HTTP/2 header overhead, and why not just gzip the headers?",
+   "checks": [
+    {
+     "label": "Static table (61 entries)",
+     "patterns": [
+      "static"
+     ]
+    },
+    {
+     "label": "Dynamic table built during the connection",
+     "patterns": [
+      "dynamic"
+     ]
+    },
+    {
+     "label": "Headers sent as indexes / repeated headers not re-sent",
+     "patterns": [
+      "index"
+     ]
+    },
+    {
+     "label": "gzip leaks secrets through compressed size (CRIME)",
+     "patterns": [
+      "crime",
+      "length",
+      "size"
+     ]
+    }
+   ],
+   "modelAnswer": "HTTP/1.1 repeats about 800 bytes of nearly identical headers on every request. HPACK gives both sides a shared static table of 61 common header fields and values (e.g. :method GET), so a field is sent as a small index. Both sides also maintain a dynamic table: a header sent once (a cookie, a custom header) is added to it, and later requests refer to it by index instead of resending it. Literal strings are Huffman-coded.\nPlain gzip/DEFLATE isn't used because headers carry secrets like cookies and JWTs. With generic compression, an attacker who can inject guesses can watch the compressed size shrink when a guess matches the secret. That is the CRIME attack, and it leaks the secret byte by byte. HPACK's indexing scheme avoids that size side-channel.",
+   "explanation": "Look for the static and dynamic tables, sending indexes instead of repeated text, and the compressed-length (CRIME) leak as the reason against gzip.",
+   "id": "L05-s7"
+  }
+ ],
+ "subtitle": "",
+ "quiz": [
+  {
+   "quiz": 2,
+   "qn": 13,
+   "lecture": 5,
+   "title": "Persistent Connections in HTTP/1.1",
+   "q": "HTTP/1.0 (RFC 1945) opens one TCP connection per response. What changed by default in early HTTP/1.1 (RFC 2068)?",
+   "options": [
+    "Connections became persistent by default",
+    "Nothing changed until HTTP/2",
+    "Requests were compressed by default",
+    "UDP replaced TCP as the transport"
+   ],
+   "answer": 0,
+   "explanation": "In HTTP/1.0 the server closes the connection after every response, so every resource pays for a new TCP handshake. HTTP/1.1 made connections persistent by default: they stay open unless someone sends Connection: close. In 1.0, Connection: keep-alive had been only a non-standard extension.",
+   "distractors": "HTTP/1.1 changed a lot before HTTP/2; requests were not compressed by default (HPACK came with HTTP/2); and HTTP never replaced TCP with UDP until QUIC/HTTP/3.",
+   "lectureRef": "HTTP/1.1: persistent connections, Host, ETags",
+   "id": "Q2-13",
+   "ref": "<a href=\"../lectures/lecture-05.html#n-http-1-1-persistent-connections-host-etags\">Lecture 5: HTTP/1.1: persistent connections, Host, ETags</a>"
+  },
+  {
+   "quiz": 2,
+   "qn": 14,
+   "lecture": 5,
+   "title": "What ETag Catches That Timestamps Miss",
+   "q": "HTTP/1.1 describes ETag as a fingerprint, not a clock. What problem does ETag catch that Last-Modified/If-Modified-Since (clock-based) can miss?",
+   "options": [
+    "A resource changing within the same clock tick",
+    "Requests sent without a Host header",
+    "TLS certificate expiry",
+    "Requests that exceed the Range limit"
+   ],
+   "answer": 0,
+   "explanation": "Last-Modified has one-second granularity and depends on clocks, so two versions saved within the same second look identical, and skew or mtime changes add errors. An ETag is an opaque version identifier, often a content hash, so any change produces a new tag regardless of clocks, and If-None-Match catches it.",
+   "distractors": "Host headers, TLS expiry and Range limits have nothing to do with cache validators.",
+   "lectureRef": "HTTP/1.1: persistent connections, Host, ETags",
+   "id": "Q2-14",
+   "ref": "<a href=\"../lectures/lecture-05.html#n-http-1-1-persistent-connections-host-etags\">Lecture 5: HTTP/1.1: persistent connections, Host, ETags</a>"
+  },
+  {
+   "quiz": 2,
+   "qn": 15,
+   "lecture": 5,
+   "title": "The Two-Connection Guidance",
+   "q": "RFC 2068 told clients they 'SHOULD NOT maintain more than 2 connections' per server. What problem was this guidance addressing?",
+   "options": [
+    "TLS handshake cost",
+    "Load from many connections from one client on a server",
+    "DNS cache poisoning",
+    "Cookie size limits"
+   ],
+   "answer": 1,
+   "explanation": "The early HTTP/1.1 RFCs (section 8.1.4) told clients to keep at most 2 persistent connections per server, to limit the load one client could place on a server and the network. The side effect from the lecture: sites invented domain sharding (img1/img2/img3, 3 x 6 = 18 connections today) and bundlers, and the rule was later dropped while browsers settled on about 6 per host.",
+   "distractors": "The rule predates any TLS concern and has nothing to do with DNS poisoning or cookie sizes.",
+   "lectureRef": "More 1.1 additions: OPTIONS, Via, 100-continue, redirects",
+   "id": "Q2-15",
+   "ref": "<a href=\"../lectures/lecture-05.html#n-more-1-1-additions-options-via-100-continue-redirects\">Lecture 5: More 1.1 additions: OPTIONS, Via, 100-continue, redirects</a>"
+  },
+  {
+   "quiz": 2,
+   "qn": 16,
+   "lecture": 5,
+   "title": "Targeting Repeated Header Bytes",
+   "q": "We measured HTTP headers repeating 97.5% byte-for-byte across 80 requests. Which HTTP/2 mechanism directly targets this waste?",
+   "options": [
+    "Server push",
+    "QUIC connection IDs",
+    "The 9-byte frame header",
+    "HPACK header compression"
+   ],
+   "answer": 3,
+   "explanation": "HPACK is HTTP/2's header compression, aimed at exactly this repetition. A static table of 61 common headers and a dynamic table both sides build during the connection let a repeated header be sent as a small index instead of the full text, with Huffman coding for literals. It avoids plain gzip because compressed length can leak secrets such as cookies (CRIME).",
+   "distractors": "Server push sends whole resources, QUIC connection IDs support migration, and the 9-byte frame header is overhead HTTP/2 adds, not a fix for repeated headers.",
+   "lectureRef": "HTTP/2: multiplexing, HPACK and server push",
+   "id": "Q2-16",
+   "ref": "<a href=\"../lectures/lecture-05.html#n-http-2-multiplexing-hpack-and-server-push\">Lecture 5: HTTP/2: multiplexing, HPACK and server push</a>"
+  },
+  {
+   "quiz": 2,
+   "qn": 17,
+   "lecture": 5,
+   "title": "Why QUIC Rides on UDP",
+   "q": "Why does QUIC run its transport logic over UDP instead of extending TCP directly?",
+   "options": [
+    "UDP is inherently faster at the wire level than TCP",
+    "Middleboxes across the internet effectively veto changes to TCP",
+    "TCP cannot carry encrypted payloads",
+    "UDP guarantees in-order delivery, which QUIC needs"
+   ],
+   "answer": 1,
+   "explanation": "Routers, NATs, firewalls and load balancers worldwide only understand TCP and UDP and make assumptions about TCP's fields, so a modified TCP or a new transport protocol gets dropped or mangled (ossification). Building on UDP lets QUIC put reliability, streams and TLS 1.3 in user space, and encrypting almost all headers stops middleboxes from freezing it again. The lecture's summary: TCP can only be replaced by building on UDP.",
+   "distractors": "UDP is not faster on the wire, TCP carries encrypted payloads every day (TLS), and UDP guarantees no ordering at all; QUIC adds ordering itself.",
+   "lectureRef": "TCP head-of-line blocking and why HTTP/3 uses QUIC over UDP",
+   "id": "Q2-17",
+   "ref": "<a href=\"../lectures/lecture-05.html#n-tcp-head-of-line-blocking-and-why-http-3-uses-quic-over-udp\">Lecture 5: TCP head-of-line blocking and why HTTP/3 uses QUIC over UDP</a>"
+  }
+ ],
+ "prev": {
+  "num": 4,
+  "file": "lecture-04.html"
+ },
+ "next": {
+  "num": 6,
+  "file": "lecture-06.html"
+ }
+};

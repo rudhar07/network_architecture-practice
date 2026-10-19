@@ -1,0 +1,964 @@
+window.PAGE = {
+ "num": 4,
+ "title": "nginx deep dive",
+ "summary": "The class opened with a quiz revising sockets, byte order, framing and encodings, then used nginx to tie together everything about server scaling: the C10K problem, nginx's idea that a connection does not need a worker, the master/worker architecture with one epoll loop per core, epoll vs select, and zero-copy sendfile. It then covered nginx as a reverse proxy: routing by path and Host header, weighted load balancing and fallbacks, caching with LRU, directory levels and proxy_cache_lock against thundering herds, location matching and FastCGI, and closed with Base64 and compact-encoding questions.",
+ "notes": [
+  {
+   "heading": "Warm-up quiz: socket calls, addresses and ports",
+   "body": "The class opened with an (unmarked) quiz revising lecture 1. The instructor said the follow-up discussions would feed the real, marked quizzes, and that you should know **every system call a client and a server make, in order** (he may ask \"what is the fourth system call?\").\n\n```\nserver: socket() -> bind() -> listen() -> accept() -> recv()/send() -> close()\nclient: socket() -> connect() -> send()/recv() -> close()\n```\n\n- `AF_INET` = IPv4 socket; `SOCK_STREAM` = TCP byte stream (`SOCK_DGRAM` = UDP). See `man 2 socket` (section 2 = system calls).\n- **Order matters**: `listen` before `bind` fails; `accept` before `listen` fails.\n- **`INADDR_ANY`** means \"listen on every IP address of this machine\". A **client cannot connect to INADDR_ANY**: a connection needs one specific destination IP and port.\n- A machine can have **several IPs**: multiple NICs, or **IP aliasing** (several logical IPs on one interface).\n- One socket listens on **one IP or all IPs**, never an arbitrary subset. To listen on 19 of 20 IPs (keeping one for admin/internal), open **19 sockets on the same port**, one per IP. Since `accept()` blocks on a single socket, multiplex them with **select/epoll** (or make the sockets non-blocking via `fcntl`/`ioctl`).\n- **Ports below 1024 need root**; the lowest port a non-root user can bind is **1024**.\n- The maximum port is **65535** because the TCP header's port fields are **16 bits**. Patching your kernel to use 4-byte ports would not help: every other host on the network would misread your packets, and it would no longer be TCP.\n- **Ports are a TCP (layer 4) concern; IP (layer 3) only knows addresses.** Hence L3 routing looks at IPs, L4 balancing at IP + port, L7 at HTTP data such as cookies.\n- Conventional ports: HTTP 80, HTTPS **443**, POP3 **110**.\n- A bigger listen backlog does **not** let you serve more clients at once; it only lets more wait in the queue. You still need fork/threads/event loops."
+  },
+  {
+   "heading": "Warm-up quiz: byte order, framing, fork and friends",
+   "body": "### htons(2026)\n2026 decimal = `0x07EA` (needs only 11 bits). Network byte order is **big-endian**, so the bytes on the wire are `07 EA`. On a little-endian x86 host, `htons()` swaps the bytes, so if you print the result as a host integer you see `0xEA07` = **59911**.\n\n### BCD (binary-coded decimal)\nBCD stores **each decimal digit in its own 4-bit nibble**, so 2026 becomes `0x2026`: the hex looks exactly like the decimal. For an odd number of digits a nibble of all ones (`F`), which is not a valid digit, is used as padding.\n\n### fork, signals, sockets\n- `fork()` returns **0 to the child** and the **child's PID to the parent** (useful to monitor it and respawn workers). Everything (stack, globals, the accepted descriptor) is copied, which is what makes fork costly: an 8 GB process suddenly needs 16 GB.\n- **SIGKILL is signal 9** (`kill -9 <pid>`).\n- **`SO_REUSEADDR`** lets a server restart and re-bind its port immediately instead of waiting for the kernel to release it. The lecture's point: set it from the first run; if the old instance did not set it, the restarted one cannot reuse the port.\n- **tcpdump on a TLS connection is pointless** for reading content: the payload is encrypted. (It worked on the plain-text hello-world demo.)\n\n### How does the receiver know a message is complete? (framing)\nRecognise the three styles across protocols:\n\n| Style | Example |\n|---|---|\n| Fixed length | TCP and IP headers (fixed fields, e.g. 2-byte ports) |\n| Delimiter | HTTP header block ends with an empty line: **CRLF CRLF** (`\\r\\n\\r\\n`) |\n| Length prefix / TLV | HTTP body via `Content-Length`; FastCGI records |\n\nCR + LF exist because typewriters first returned the carriage, then fed the line. Sending a `Content-Length` that does not match the body used to crash servers.\n\n### JWT and Base64\nA JWT is three Base64(URL)-encoded parts (header.payload.signature); decoding the payload revealed the instructor's email, showing Base64 is **encoding, not encryption**. `aGVsbG8=` decodes to `hello`; deleting the final `=` changes nothing for most decoders because **`=` is only padding** to a multiple of 4 characters (just like the BCD `F`)."
+  },
+  {
+   "heading": "History: from Apache's fork to nginx",
+   "body": "The instructor likes learning from history: if you understand how things evolved, you can change the timeline yourself.\n\n- Tim Berners-Lee wrote the first HTTP server; **httpd = HTTP daemon** (a daemon is a process that keeps running in the background). NCSA's Mosaic browser and NCSA httpd followed; **Apache httpd** took over in the late 90s (IIS existed too).\n- Apache's whole life was making fork cheaper: **fork per request -> pre-fork -> multi-processing modules (MPM) -> threads (pthreads on Linux were new and buggy around 1999 to 2002) -> threads + event loop.**\n- Java servers went another way: threads (now **virtual threads**) with each request in a logically separate context, encapsulated by classes.\n\n### The C10K problem\nThreads reserved around **8 MB** each, so **10,000 connections x 8 MB = 80 GB of memory**, at a time when a lab machine had about 4 MB of RAM. File-descriptor limits were around 1024 and servers still used select's bitmap. Someone set out to handle more than 10,000 connections on one machine and wrote **nginx**: \"a bit of cheating\", because he moved the compute (which Apache did in-process) somewhere else. Even in beta it was a killer.\n\n**Beyond the lecture:** nginx was written by Igor Sysoev and released publicly in 2004; the C10K problem was named by Dan Kegel in 1999.\n\nIt is called a **reverse proxy** only because \"proxy\" already meant the client-side (forward) caching proxy."
+  },
+  {
+   "heading": "nginx's key idea: change the question",
+   "body": "The old question was **\"how do we make a worker per connection cheaper?\"** nginx asked a different one: **\"why does a connection need a worker at all?\"**\n\n- A connection only needs **a few hundred bytes** of state; **work** needs a thread. So the nginx worker does only **I/O** and hands the heavy work (PHP, Python, Java...) to someone else: an upstream app server.\n- That upstream does not have to be reached over TCP. Options on the same machine:\n  - TCP to localhost,\n  - fork + exec (CGI style; rejected because of RAM),\n  - **Unix domain sockets (`AF_UNIX`)**: same socket API as `AF_INET` but local-only and very efficient (pipes/queues are also possible).\n- **One process per core, one event loop per process.** Two cores, two event loops; three cores, three. You can run more loops than cores, but they will just context-switch.\n\nThe lesson the instructor repeated at the end: **sometimes asking a different question solves a problem that stayed unsolved for 20 years.**"
+  },
+  {
+   "heading": "Architecture: master, workers and the event loop",
+   "body": "```\n               +--------------------------------------------+\n               | master process (root)                       |\n               |  binds :80/:443, reads nginx.conf,          |\n               |  forks workers, respawns/reloads them       |\n               +-------+--------------+--------------+------+\n                       |              |              |\n                 worker (core 0)  worker (core 1)  worker (core 2)\n                 epoll loop       epoll loop       epoll loop\n                 thousands of     thousands of     thousands of\n                 connections      connections      connections\n```\n\n- Startup: **bind the port, read the config, pre-fork the workers**; every worker runs an **epoll event loop** (\"a faster select\"). The master knows each worker's PID (fork's return value); a worker can find its parent with `getppid()`.\n- Inside a worker: wait for events with a **timer** (timeouts are essential in any event loop), process the ready events, repeat. It is essentially **first-come, first-served asynchronous processing**: whatever becomes readable/writable first is handled first.\n- Load between workers: a worker can cap how many connections it handles; once most of its connection slots are in use it **stops accepting** and leaves new connections to other workers. If nobody can accept, connections wait in the queue (and a master could spawn more workers).\n\n**Beyond the lecture:** the cap is `worker_connections`; the real nginx rule stops a worker accepting once fewer than 1/8 of its slots are free (the lecture used \"about 70%\" as an illustration). `worker_processes auto;` gives one worker per core.\n\n### Thundering herd\nWhen one event (a new connection, a lock released, a cache entry expiring) **wakes many waiters at once but only one can use it**, they all stampede and most of the work is wasted. Examples from class: many processes woken by one `accept`-able connection; many threads woken when a mutex unlocks; traffic all shifting to the one remaining healthy server; a hot cache entry expiring so every request goes to the upstream. nginx's answers: workers accept in a controlled way (**Beyond the lecture:** `accept_mutex`, or `reuseport` giving each worker its own listening socket) and **`proxy_cache_lock`** for the cache case (see caching)."
+  },
+  {
+   "heading": "epoll vs select",
+   "body": "- With **select**, after it returns you loop over **every** descriptor you registered and test it with `FD_ISSET`, wasting time on idle ones, and the kernel also scans them all.\n- With **epoll**, you register descriptors once and `epoll_wait()` returns **a list of only the ready ones**; the is-set scan disappears.\n\nThe instructor said this one is important: **with 10,000 idle connections and 10 active ones, select still makes you walk all 10,000; epoll hands you just the 10.** No wasted cycles.\n\n| | select | epoll |\n|---|---|---|\n| Registration | rebuild the fd_set before every call | register once (`epoll_ctl`) |\n| Returned | the whole set; you scan it | only ready descriptors (a batch) |\n| Cost per wake | O(all descriptors) | O(ready descriptors) |\n| Limit | FD_SETSIZE = 1024 | no fixed cap (bounded by ulimit/memory) |\n| Availability | everywhere | **Linux only** |\n\n**epoll is a Linux system call**: BSD, Solaris and macOS (Darwin) do not have it; BSD and macOS use **kqueue**. Every event loop (epoll, kqueue, Python's Tornado) looks very similar: wait for a batch, handle each event (read, write, close), repeat. Try it: run the same loop with poll and with select, and select burns more CPU because its loop is longer."
+  },
+  {
+   "heading": "sendfile, the page cache and mmap",
+   "body": "- When you read from disk, the kernel builds a **page cache** of the file transparently to your process.\n- Normal send: data goes from the page cache into **your user-space buffer** (a copy), then back into the **kernel socket buffer** (another copy), then to the NIC.\n- **`sendfile()`**: you tell the kernel \"send this file on this socket\", and it moves the data from the page cache to the socket with **no user-space copy**. nginx did not invent it; it chose to use this existing system call.\n- To send an HTTP response: write the **headers** first on the socket, then the blank-line delimiter, then call `sendfile` for the body.\n\nWhen it cannot help:\n- If you need to **gzip** or otherwise **modify** the bytes before sending; the copy is needed anyway, so you lose the benefit.\n- In a simple single-machine **loopback** (127.0.0.1) load test it looks only slightly better, though you can see fewer system calls; at **very high concurrency** it becomes very effective.\n\n**Beyond the lecture:** the bytes saved by avoiding the copy grow with the file size, so sendfile matters most for large static files; for tiny responses the per-request overhead dominates. With TLS, data must be encrypted, so plain sendfile only works with kernel TLS.\n\n### mmap\n`mmap` maps a file on disk onto a memory range: nothing is in RAM until you touch it, then pages are loaded on demand. It is handy for reading parts of huge files without reading the whole thing. The idea of laying a data structure out in a file and mapping it back is behind serialisation formats; Python pickle files and **GGUF model files** (metadata followed by long runs of weights) follow the same spirit. The instructor called mmap a \"lost art\" worth trying."
+  },
+  {
+   "heading": "Reverse proxying: routing by path and by host",
+   "body": "A reverse proxy sits close to your servers and can route, balance and cache.\n\n- **Routing by path**: `/api` to one machine, `/static` to another, or to the same machine on different ports.\n- **Routing by host**: the IP/TCP connection carries only IP addresses and ports; after `getaddrinfo()` you only have an IP. The DNS name you used must therefore be sent again inside HTTP as the **`Host` header**, which is why the earlier Google telnet demo needed `Host: google.com`. One IP can then serve ten different domains or subdomains, and the proxy routes on the Host value.\n\n```nginx\nserver {\n    listen 80;\n    server_name shop.example.com;          # routing by host\n    location /api/   { proxy_pass http://api_pool; }       # routing by path\n    location /static/ { root /var/www; }                    # served from disk (sendfile)\n}\nserver {\n    listen 80;\n    server_name blog.example.com;\n    location / { proxy_pass http://127.0.0.1:8081; }\n}\n```\n\n(Directive syntax shown is standard nginx; the lecture's demo files covered routing, weights, fallbacks and cache.)"
+  },
+  {
+   "heading": "Load balancing and fallbacks",
+   "body": "- **Round robin**: each upstream in turn. **Weighted round robin**: give a more powerful machine a bigger weight so it receives more connections.\n- **Fallbacks**: \"try this, otherwise that, otherwise 404\". The famous example is **WordPress**: if the requested file exists, serve it; otherwise send everything to `index.php`, which reads the path and decides which post to show.\n- Fallbacks can cross the network: try server A, else server B (another IP). The instructor's own pattern: the main upstream does personalisation and other clever things; a **dummy server returning static values** is the fallback if the main one is slow or dead.\n\n```nginx\nupstream api_pool {\n    server 10.0.0.11 weight=3;     # bigger machine gets ~3x traffic\n    server 10.0.0.12 weight=1;\n    server 10.0.0.99 backup;       # static fallback, only used if the others fail\n}\nlocation / {\n    try_files $uri $uri/ /index.php?$args;   # WordPress-style fallback\n}\n```\n\n### Redundancy all the way down\n- **DNS round robin**: a name can resolve to several IPs; the client (browser or your own code) picks one and can fall back to another. On top of that, nginx/HAProxy can balance across upstreams again.\n- Server-grade machines have **dual Ethernet and dual power**, wired to different routers, ideally on different ISPs.\n- This layering of fallbacks and multiple upstreams is \"how the internet stays alive\"."
+  },
+  {
+   "heading": "Caching in nginx",
+   "body": "Introduced here because a later lecture (CDNs) builds on it.\n\n```nginx\nproxy_cache_path /var/cache/nginx levels=1:2 keys_zone=mycache:10m\n                 max_size=1g inactive=60m;\nlocation / {\n    proxy_cache      mycache;\n    proxy_cache_lock on;         # NOT on by default\n    proxy_pass       http://api_pool;\n}\n```\n\n- A **key** identifies each entry; the **index (keys) lives in shared memory** while the cached bodies live on disk, just like a database index pointing at the real data.\n- **`max_size`**: beyond it the least-recently-used entries are evicted (**LRU**). Entries also expire by TTL / inactivity. LRU is easy: when full, drop the least recently used. (Learn queues, doubly linked lists and LRU; they are everywhere.)\n- **`levels=1:2`**: store files in **two directory levels** (e.g. `c/29/<hash>`) so no single directory holds a million files.\n\n### Why levels matter: directories and inodes\nIn ext2-style file systems a directory is itself a file listing entries, and every file uses an **inode** (which records where its data blocks are). A gigantic directory makes lookups and `stat` slow, and you can even run out of inodes with millions of tiny or empty files: check with **`df -i`** (`df -h` for human-readable space). The instructor recommended Maurice Bach's book on the Unix operating system for these details.\n\n### proxy_cache_lock: the thundering herd on the cache\nThe instructor called this **super important** and **not on by default**. When a popular entry expires or is missing, every request misses at once and all of them go to the upstream (a cache stampede). nginx workers are separate processes with separate event loops, so they cannot see that the others are fetching the same object; the only thing they share is the cache metadata. `proxy_cache_lock` puts a **lock per cache key** there: the first request fetches from upstream, the others **wait** for it and are then served from cache.\n\nThis only works **within one machine**; across many machines you need a distributed approach (the classic memcached papers from LiveJournal/Facebook discuss it)."
+  },
+  {
+   "heading": "location matching and the data structures behind it",
+   "body": "nginx `location` blocks (like Apache virtual hosts/locations) can match in several ways:\n\n| Form | Meaning |\n|---|---|\n| `location = /login` | exact match |\n| `location /images/` | prefix (starts-with) match |\n| `location ^~ /static/` | prefix match that skips regex checking if it is the longest prefix |\n| `location ~ \\.php$` / `~*` | regular expression (case-sensitive / case-insensitive) |\n\n- **Prefix matching is cheap** (plain string comparison); **regular expressions are costly**, and the instructor admitted nobody is truly good at writing them (he found regex bugs years later).\n- nginx organises prefix locations in tree structures, and uses **hash tables with chaining** (colliding keys stored in a linked list per bucket) for things like server names. Red-black trees appear in nginx too; know these structures exist even if you never implement them.\n\n**Beyond the lecture (precedence):** 1. an exact `=` match wins immediately; 2. otherwise nginx finds the **longest matching prefix** and remembers it; 3. if that prefix has `^~`, use it; 4. otherwise test regexes **in config-file order**, and the **first** that matches wins; 5. if no regex matches, use the remembered longest prefix.\n\nThe instructor's summary of what to know (not the code itself): implement LRU; avoid huge directories with 2 to 4 level layouts; match across multiple locations with a one-line fallback; do round robin and weighted round robin."
+  },
+  {
+   "heading": "FastCGI from nginx",
+   "body": "`proxy_pass` speaks HTTP to upstreams; **`fastcgi_pass`** speaks FastCGI (e.g. to **PHP-FPM**), which avoids fork+exec per request. Django and others can sit behind it too.\n\n```nginx\nlocation ~ \\.php$ {\n    include      fastcgi_params;            # REQUEST_METHOD, QUERY_STRING, SCRIPT_FILENAME...\n    fastcgi_pass unix:/run/php/php-fpm.sock;   # Unix domain socket upstream\n}\n```\n\nFastCGI on the wire:\n- Every record header carries a **length** (and a type): it is **TLV** (type-length-value).\n- An **empty record** marks the end of a stream: the delimiter.\n- Header fields include **paddingLength** and **reserved**.\n- **Reserved bytes** appear in many binary protocols: spare bytes kept for future extensions without redesigning the format. The instructor's lament: if TCP had kept a couple of reserved bytes, ports could have been made larger.\n\n**Beyond the lecture:** the 8-byte FastCGI record header is version, type, requestId (2 bytes), contentLength (2 bytes), paddingLength, reserved."
+  },
+  {
+   "heading": "Big ideas: pre-work, CapEx vs OpEx, amortisation",
+   "body": "The lecture was mostly a re-run of lectures 1 to 3 seen through nginx, and pulled out general ideas that keep recurring:\n\n- **Ask a different question** (\"why does a connection need a worker?\") and old problems dissolve.\n- **Spend first, serve fast**: pre-fork, pre-create threads, organise things up front, so serving each request is cheap. Pay for the cache lock so a burst does not crush the upstream.\n- **CapEx vs OpEx**: capital expenditure is paying up front (buy a server and run open models on it); operational expenditure is paying as you go, which grows only if the business grows. Startups often lack CapEx, and buying/configuring hardware is slow, so many moved to OpEx (cloud). Doing work in advance is the CapEx mindset applied to servers.\n- **Amortisation**: do the costly work once and spread its cost over every later use (as in hash tables, where occasional costly resizing averages out per operation).\n- **Know the rules so you can break them sometimes**: thread-per-connection died because threads carry state; goroutines, virtual threads and green threads revived cheap per-task contexts.\n- Do not skip data structures: queues, doubly linked lists, LRU, hashes with chaining and red-black trees all live inside nginx.\n\nThe instructor said he will not ask about nginx source code or about implementing LRU/regex/data structures; he will ask about the **concepts**."
+  },
+  {
+   "heading": "End-of-class quiz: Base64 and compact encodings",
+   "body": "- **Base64 alphabet**: `A-Z`, `a-z`, `0-9` (62 characters) plus `+` and `/` = 64, with **`=` as padding**. 6 bits per character, so 3 bytes become 4 characters (about **33% larger**). You could define your own alphabet; **Base32** (e.g. only capitals and digits) uses 5 bits per character.\n- `base64` / `base64 -d` on the command line encode and decode.\n\n### Where Base64 is used\n- **Inline images** in HTML: `<img src=\"data:image/png;base64,...\">`. Bigger than the original file, but for many tiny images it saves a separate request each (connection and header overhead).\n- **Email attachments**: email is a pure-text protocol, so binary must be text-encoded.\n- **CI/CD variables** and command-line arguments that cannot contain arbitrary bytes.\n- **JWTs**, and **HTTP Basic authentication** (`Authorization: Basic base64(user:password)`), which is effectively clear text because Base64 is reversible.\n- By contrast, an HTTP **body** can carry raw bytes (`application/octet-stream`) because `Content-Length` and the header delimiter already frame it.\n\n### Packing text into fewer bits\nIf messages only use **27 symbols** (26 lowercase letters + space), each needs only **5 bits** (2^5 = 32 >= 27). A 140-byte message has 140 x 8 = 1120 bits, so it fits **1120 / 5 = 224 characters** instead of 140. (The same calculation appears in SMS with 7-bit characters: 140 bytes = 160 characters.)\n\n### Other quick ones\n- POP3 uses port **110**.\n- TCP opening is a 3-way handshake; a normal **close exchanges 4 messages** (FIN, ACK, FIN, ACK).\n- **SYN cookies** defend against SYN floods."
+  },
+  {
+   "heading": "Quick revision",
+   "body": "- Server: socket -> bind -> listen -> accept; client: socket -> connect. Wrong order fails.\n- INADDR_ANY = all local IPs, server-side only; listening on a subset needs one socket per IP + select/epoll.\n- Ports < 1024 need root; max port 65535 because the TCP port field is 16 bits; ports are a TCP concern.\n- htons(2026): 0x07EA on the wire; 0xEA07 = 59911 when read back on little-endian x86. BCD 2026 = 0x2026.\n- Framing: fixed length (TCP/IP headers), delimiter (HTTP CRLF CRLF), length prefix/TLV (Content-Length, FastCGI).\n- `=` in Base64 is padding; Base64 is encoding, not encryption.\n- C10K: 10,000 threads x 8 MB = 80 GB, so thread-per-connection could not scale.\n- nginx: a connection does not need a thread; workers only do I/O and pass work to upstreams (TCP or Unix sockets).\n- Master process + one worker per core, each with one epoll event loop and timers.\n- Thundering herd: one event wakes many waiters, only one can win.\n- epoll returns only ready fds (10 of 10,000); select makes you scan all; epoll is Linux-only, kqueue on BSD/macOS.\n- sendfile: kernel sends the file from page cache to the socket with no user-space copy; useless if you must gzip/modify.\n- Host header exists because TCP/IP carries no hostname; it enables many sites per IP.\n- Weighted round robin, `backup` servers, `try_files ... /index.php` fallback (WordPress).\n- `proxy_cache_path ... levels=1:2 keys_zone=... max_size=...`; LRU eviction; two directory levels to protect inodes (`df -i`).\n- `proxy_cache_lock` (off by default) stops a cache stampede: one request refills, the rest wait.\n- location: exact `=` first, then longest prefix, then regex in file order; prefix is cheap, regex costly.\n- FastCGI via `fastcgi_pass` to PHP-FPM; TLV records with padding and reserved bytes.\n- 27 symbols need 5 bits, so 140 bytes hold 224 characters."
+  },
+  {
+   "heading": "Exam traps",
+   "body": "- **INADDR_ANY on the client**: invalid as a destination; a client must name one specific IP.\n- **A bigger listen backlog is not concurrency**: it only lengthens the queue.\n- **htons output**: the wire bytes are `07 EA`; the value *printed* on x86 is `0xEA07` (59911). Do not confuse the two.\n- **BCD vs binary**: 2026 in BCD is `0x2026`; in binary it is `0x07EA`.\n- **Ports live in the TCP/UDP header**, not in the IP header.\n- **SO_REUSEADDR vs SO_REUSEPORT**: REUSEADDR is about re-binding quickly after a restart; REUSEPORT (beyond the lecture) lets several sockets share a port for load spreading.\n- **epoll is not portable**: Linux only; macOS/BSD use kqueue.\n- **epoll's win is with many idle connections**: with every connection always busy, the difference shrinks.\n- **sendfile and compression do not mix**: gzip requires the bytes in user space.\n- **proxy_cache_lock is off by default**, and it only coordinates the workers of one machine, not a cluster.\n- **\"Reverse proxy\" is about who it serves** (the servers), not about traffic direction.\n- **Regex locations are not checked in \"longest match\" order**: the first regex in the file that matches wins.\n- **Base64 makes data bigger** (about 4/3), and Basic auth's Base64 is not protection.\n- **Closing TCP takes 4 messages**, opening takes 3."
+  }
+ ],
+ "keyTerms": [
+  {
+   "term": "nginx",
+   "def": "Event-driven web server, reverse proxy, load balancer and cache built to solve C10K with one epoll loop per worker process."
+  },
+  {
+   "term": "httpd",
+   "def": "HTTP daemon: a web server process that keeps running in the background."
+  },
+  {
+   "term": "C10K problem",
+   "def": "Serving 10,000 concurrent connections on one machine; impossible with 8 MB per thread (80 GB)."
+  },
+  {
+   "term": "Master / worker processes",
+   "def": "nginx's model: a master binds ports, reads config and manages one event-loop worker per CPU core."
+  },
+  {
+   "term": "Unix domain socket (AF_UNIX)",
+   "def": "Socket for communication between processes on the same machine; efficient upstream link for nginx."
+  },
+  {
+   "term": "Thundering herd",
+   "def": "Many waiters woken by one event when only one can handle it, wasting work (accept, mutex unlock, cache expiry)."
+  },
+  {
+   "term": "epoll",
+   "def": "Linux event-notification API: register descriptors once, epoll_wait returns only the ready ones."
+  },
+  {
+   "term": "kqueue",
+   "def": "BSD/macOS equivalent of epoll."
+  },
+  {
+   "term": "sendfile()",
+   "def": "Zero-copy system call that sends a file from the kernel page cache straight to a socket."
+  },
+  {
+   "term": "Page cache",
+   "def": "Kernel's in-memory cache of file data, filled transparently when files are read."
+  },
+  {
+   "term": "mmap",
+   "def": "Maps a file into memory so pages are loaded on demand when accessed."
+  },
+  {
+   "term": "Host header",
+   "def": "HTTP header naming the requested site, needed because TCP/IP carries only IPs; enables many sites per IP."
+  },
+  {
+   "term": "Weighted round robin",
+   "def": "Load balancing in turn, giving servers with higher weight proportionally more requests."
+  },
+  {
+   "term": "try_files",
+   "def": "nginx directive that tries files in order and falls back to the last option (e.g. /index.php)."
+  },
+  {
+   "term": "proxy_cache_path levels=1:2",
+   "def": "Stores cached files in two nested directory levels so no directory holds millions of files."
+  },
+  {
+   "term": "Inode",
+   "def": "File-system record describing a file and where its data blocks are; can run out with millions of tiny files (df -i)."
+  },
+  {
+   "term": "LRU cache",
+   "def": "Evicts the least recently used entry when the cache is full."
+  },
+  {
+   "term": "proxy_cache_lock",
+   "def": "Off-by-default nginx setting: only one request per cache key fetches from upstream while others wait."
+  },
+  {
+   "term": "location block",
+   "def": "nginx request-matching rule: exact (=), prefix, ^~ prefix, or regex (~, ~*)."
+  },
+  {
+   "term": "fastcgi_pass",
+   "def": "nginx directive forwarding requests to a FastCGI upstream such as PHP-FPM."
+  },
+  {
+   "term": "TLV",
+   "def": "Type-length-value framing, as used by FastCGI records."
+  },
+  {
+   "term": "Reserved bytes",
+   "def": "Unused header bytes kept for future protocol extensions."
+  },
+  {
+   "term": "BCD",
+   "def": "Binary-coded decimal: each decimal digit in its own 4-bit nibble (2026 -> 0x2026)."
+  },
+  {
+   "term": "Base64",
+   "def": "Encoding of binary as 64 text characters (A-Z, a-z, 0-9, +, /) with = padding; 4/3 size, not encryption."
+  },
+  {
+   "term": "SO_REUSEADDR",
+   "def": "Socket option allowing a restarted server to re-bind its port immediately."
+  },
+  {
+   "term": "CapEx vs OpEx",
+   "def": "Up-front capital spending vs pay-as-you-go operating spending."
+  },
+  {
+   "term": "Amortisation",
+   "def": "Spreading a one-time cost across many later operations."
+  }
+ ],
+ "mcqs": [
+  {
+   "q": "What is the correct order of system calls for a TCP server before it can exchange data with a client?",
+   "options": [
+    "socket() -> bind() -> listen() -> accept()",
+    "socket() -> listen() -> bind() -> accept()",
+    "socket() -> accept() -> bind() -> listen()",
+    "bind() -> socket() -> listen() -> accept()"
+   ],
+   "answer": 0,
+   "explanation": "You create the socket, bind it to an address/port, mark it listening, and only then can accept() return connected sockets.",
+   "distractors": "listen before bind and accept before listen both fail; bind needs a socket descriptor to exist first.",
+   "source": "lecture",
+   "id": "L04-m1"
+  },
+  {
+   "q": "Why can a client not use `INADDR_ANY` as the address in `connect()`?",
+   "options": [
+    "INADDR_ANY is valid only for IPv6 sockets",
+    "INADDR_ANY is reserved for UDP broadcast",
+    "INADDR_ANY only tells a listening server to accept on all local IPs; a client must connect to one specific destination IP",
+    "Using INADDR_ANY requires root privileges"
+   ],
+   "answer": 2,
+   "explanation": "A connection is identified by a specific remote IP and port; 'any address' has no meaning as a destination.",
+   "distractors": "INADDR_ANY is the IPv4 wildcard, unrelated to broadcast or root privileges.",
+   "source": "lecture",
+   "id": "L04-m2"
+  },
+  {
+   "q": "On a little-endian x86 machine, what value do you see if you print `htons(2026)` as an ordinary integer?",
+   "options": [
+    "2026 (0x07EA)",
+    "59911 (0xEA07)",
+    "32416 (0x7EA0)",
+    "2602 (0x0A2A)"
+   ],
+   "answer": 1,
+   "explanation": "2026 = 0x07EA; htons swaps the two bytes for big-endian network order, which a little-endian host reads back as 0xEA07 = 59911.",
+   "distractors": "0x07EA would mean no swap happened; 0x7EA0 shifts nibbles instead of swapping bytes.",
+   "source": "lecture",
+   "id": "L04-m3"
+  },
+  {
+   "q": "Why can't you allow port 70,000 just by patching your own kernel?",
+   "options": [
+    "ulimit caps ports at 65535 and cannot be raised",
+    "IANA forbids ports above 65535 by policy",
+    "IPv4 addresses are only 32 bits wide",
+    "The TCP header's port fields are 16 bits, so every other host would misinterpret the packets"
+   ],
+   "answer": 3,
+   "explanation": "The 65535 limit is baked into the TCP wire format; changing it unilaterally creates a protocol no one else speaks.",
+   "distractors": "ulimit governs descriptors, not ports; it is a protocol limit, not a policy; IP address width is irrelevant to ports.",
+   "source": "lecture",
+   "id": "L04-m4"
+  },
+  {
+   "q": "A server has 20 IP addresses. You want it to listen on port 443 on 19 of them, reserving one for internal use. How?",
+   "options": [
+    "One socket bound to INADDR_ANY with a netmask excluding the 20th IP",
+    "Call bind() 19 times on the same socket",
+    "It is impossible; a port can be listened on only once per machine",
+    "Open 19 sockets, each bound to one IP on port 443, and wait on all of them with select/epoll"
+   ],
+   "answer": 3,
+   "explanation": "A socket binds to one IP or to all of them; a subset needs one socket per IP, and since accept() blocks on one socket you multiplex them.",
+   "distractors": "There is no 'subset' bind and a socket can only be bound once; the same port on different IPs is allowed.",
+   "source": "lecture",
+   "id": "L04-m5"
+  },
+  {
+   "q": "What is the lowest port number a non-root process can bind to on Linux by default?",
+   "options": [
+    "1024",
+    "1023",
+    "80",
+    "0"
+   ],
+   "answer": 0,
+   "explanation": "Ports 0 to 1023 are privileged and need root (or a capability); 1024 is the first unprivileged port.",
+   "distractors": "1023 is the last privileged port; 80 needs root; port 0 asks the kernel for a random ephemeral port.",
+   "source": "lecture",
+   "id": "L04-m6"
+  },
+  {
+   "q": "What is `SO_REUSEADDR` mainly used for?",
+   "options": [
+    "Letting several processes share one port for load spreading",
+    "Reusing a client IP address across connections",
+    "Letting a restarted server re-bind its port immediately instead of waiting for the kernel to release it",
+    "Keeping idle connections alive between requests"
+   ],
+   "answer": 2,
+   "explanation": "Without it, a quickly restarted server gets 'address already in use' while old connections linger; the lecture said to set it from the first run.",
+   "distractors": "Port sharing for load spreading is SO_REUSEPORT; keep-alive is a separate HTTP/TCP feature.",
+   "source": "lecture",
+   "id": "L04-m7"
+  },
+  {
+   "q": "How is the decimal number 2026 represented in BCD (binary-coded decimal), written in hex?",
+   "options": [
+    "0x07EA",
+    "0x2026",
+    "0xEA07",
+    "0x7E2F"
+   ],
+   "answer": 1,
+   "explanation": "BCD gives each decimal digit its own 4-bit nibble, so the hex digits read 2,0,2,6, exactly like the decimal.",
+   "distractors": "0x07EA is plain binary 2026 and 0xEA07 is its byte-swapped form.",
+   "source": "lecture",
+   "id": "L04-m8"
+  },
+  {
+   "q": "What question did nginx answer differently from Apache to solve C10K?",
+   "options": [
+    "How can thread stacks be shrunk so one thread per connection fits in RAM?",
+    "Why does a connection need its own worker at all? Connections need only a few hundred bytes; workers do I/O in an event loop and hand work to upstreams",
+    "How can fork() be made faster with copy-on-write?",
+    "How can the listen backlog be made large enough for 10,000 clients?"
+   ],
+   "answer": 1,
+   "explanation": "Instead of making per-connection workers cheaper, nginx removed them: one epoll loop per core multiplexes thousands of connections.",
+   "distractors": "Smaller threads and faster fork are still worker-per-connection; a larger backlog only queues clients.",
+   "source": "lecture",
+   "id": "L04-m9"
+  },
+  {
+   "q": "A server holds 10,000 open connections, of which 10 have data ready. What does epoll do better than select here?",
+   "options": [
+    "epoll reads the data from the 10 sockets automatically",
+    "select cannot hold 10,000 connections, but epoll compresses them",
+    "epoll processes the 10 connections in parallel threads",
+    "epoll_wait returns just the 10 ready descriptors; with select the program must scan all 10,000"
+   ],
+   "answer": 3,
+   "explanation": "select's cost scales with all registered descriptors; epoll's with ready ones, so idle connections cost almost nothing.",
+   "distractors": "epoll only reports readiness, it neither reads data nor creates threads; 'compressing' connections is meaningless.",
+   "source": "lecture",
+   "id": "L04-m10"
+  },
+  {
+   "q": "You deploy an nginx-style epoll server on macOS. What happens?",
+   "options": [
+    "epoll is Linux-only, so it must use macOS's kqueue (or fall back to poll/select)",
+    "It works unchanged because epoll is POSIX",
+    "It works, but only for IPv6",
+    "macOS translates epoll calls into select automatically"
+   ],
+   "answer": 0,
+   "explanation": "epoll is a Linux system call; BSD and Darwin provide kqueue, which nginx supports as its event method there.",
+   "distractors": "epoll is not part of POSIX, and macOS has no epoll translation layer.",
+   "source": "lecture",
+   "id": "L04-m11"
+  },
+  {
+   "q": "In which situation can nginx NOT benefit from `sendfile()` for a response body?",
+   "options": [
+    "When the file is on local disk",
+    "When the client uses HTTP/1.1 keep-alive",
+    "When it must gzip-compress or otherwise modify the file before sending it",
+    "When the headers are sent before the body"
+   ],
+   "answer": 2,
+   "explanation": "sendfile moves bytes unchanged from page cache to socket; any transformation needs the data in user space, so the copy cannot be avoided.",
+   "distractors": "Local files, keep-alive and headers-first are exactly the normal sendfile case.",
+   "source": "lecture",
+   "id": "L04-m12"
+  },
+  {
+   "q": "Why does HTTP/1.1 need a `Host` header?",
+   "options": [
+    "The Host header carries the client's IP address for logging",
+    "Routers use it to choose the network path",
+    "The TCP/IP connection carries only IP addresses and ports, so the hostname must be sent in HTTP for one IP to serve many sites",
+    "It encrypts the domain name during the TLS handshake"
+   ],
+   "answer": 2,
+   "explanation": "After DNS resolution only an IP remains; the Host header tells the server (or reverse proxy) which of its sites you want.",
+   "distractors": "Routers never read HTTP, the client IP is already in the IP header, and Host is not encryption.",
+   "source": "lecture",
+   "id": "L04-m13"
+  },
+  {
+   "q": "What does `levels=1:2` in `proxy_cache_path` do?",
+   "options": [
+    "Creates a RAM tier and a disk tier",
+    "Spreads cached files across two directory levels so no single directory holds millions of files",
+    "Sets the LRU eviction ratio to 1:2",
+    "Replicates the cache onto two disks"
+   ],
+   "answer": 1,
+   "explanation": "Huge directories make lookups slow and stress inodes; hashing files into nested subdirectories keeps each directory small.",
+   "distractors": "Memory vs disk is keys_zone vs the path, eviction is via max_size/inactive, and there is no replication.",
+   "source": "lecture",
+   "id": "L04-m14"
+  },
+  {
+   "q": "A popular cached page expires and 5,000 requests arrive in the same second. Which nginx setting prevents all of them from hitting the upstream?",
+   "options": [
+    "worker_processes auto",
+    "sendfile on",
+    "keepalive_timeout 0",
+    "proxy_cache_lock on (off by default): one request refills the entry, the others wait"
+   ],
+   "answer": 3,
+   "explanation": "This is the thundering-herd / cache-stampede problem; a per-key lock lets one fetch proceed while the rest are served from cache afterwards.",
+   "distractors": "Worker count, sendfile and keep-alive do not stop concurrent cache misses from going upstream.",
+   "source": "lecture",
+   "id": "L04-m15"
+  },
+  {
+   "q": "What does the WordPress-style rule `try_files $uri $uri/ /index.php?$args;` do?",
+   "options": [
+    "Serve the file or directory if it exists, otherwise hand the request to /index.php",
+    "Always run index.php first, then serve static files",
+    "Return 404 for any file not on disk",
+    "Redirect the browser to /index.php"
+   ],
+   "answer": 0,
+   "explanation": "try_files checks each option in order and uses the last as the fallback; index.php then interprets the path to find the post.",
+   "distractors": "Static files are served directly when present, and the fallback is an internal rewrite, not a 404 or browser redirect.",
+   "source": "lecture",
+   "id": "L04-m16"
+  },
+  {
+   "q": "For a request to /images/logo.png, which nginx location type is checked first and wins immediately if it matches?",
+   "options": [
+    "An exact match: location = /images/logo.png",
+    "The first regex location in the file",
+    "The shortest matching prefix",
+    "The last location block in the file"
+   ],
+   "answer": 0,
+   "explanation": "nginx checks exact '=' locations first; otherwise it finds the longest prefix, then tries regexes in file order.",
+   "distractors": "Regexes come after prefix search, nginx prefers the longest (not shortest) prefix, and file position matters only among regexes.",
+   "source": "lecture",
+   "id": "L04-m17"
+  },
+  {
+   "q": "The Base64 string `aGVsbG8=` decodes to `hello`. What happens if you delete the trailing `=`?",
+   "options": [
+    "It decodes to 'hell'",
+    "It becomes undecodable garbage",
+    "It decodes to 'hello' followed by a null byte",
+    "Most decoders still return 'hello', because '=' is only padding to a multiple of 4 characters"
+   ],
+   "answer": 3,
+   "explanation": "The 7 remaining characters still carry all 40 bits of 'hello'; '=' just pads the length (strict decoders may complain).",
+   "distractors": "No data bits are stored in '=', so nothing is lost and nothing is added.",
+   "source": "lecture",
+   "id": "L04-m18"
+  },
+  {
+   "q": "Messages use only 26 lowercase letters plus space. How many characters fit in a 140-byte payload with an optimal fixed-width code?",
+   "options": [
+    "140",
+    "160",
+    "224",
+    "280"
+   ],
+   "answer": 2,
+   "explanation": "27 symbols need 5 bits (2^5 = 32); 140 x 8 = 1120 bits, and 1120 / 5 = 224 characters.",
+   "distractors": "140 assumes 8-bit characters and 160 assumes 7-bit SMS encoding; 280 would need 4 bits, which allows only 16 symbols.",
+   "source": "lecture",
+   "id": "L04-m19"
+  },
+  {
+   "q": "Which best describes the thundering-herd problem?",
+   "options": [
+    "A single client opening thousands of connections",
+    "One event wakes many waiting processes or threads, but only one can handle it, so the rest waste work",
+    "Packets arriving out of order and being retransmitted",
+    "Too many log lines written at once"
+   ],
+   "answer": 1,
+   "explanation": "Examples from class: many workers woken for one new connection, many threads woken by one unlock, many requests refetching an expired cache key.",
+   "distractors": "The other options describe floods, reordering and logging, not many waiters woken for one resource.",
+   "source": "lecture",
+   "id": "L04-m20"
+  }
+ ],
+ "short": [
+  {
+   "q": "Describe nginx's process architecture and explain why it handles far more concurrent connections than thread-per-connection servers.",
+   "checks": [
+    {
+     "label": "master process",
+     "patterns": [
+      "master"
+     ]
+    },
+    {
+     "label": "worker processes per core",
+     "patterns": [
+      "worker.{0,40}(core|cpu)",
+      "(core|cpu).{0,40}worker"
+     ]
+    },
+    {
+     "label": "epoll / event loop",
+     "patterns": [
+      "epoll",
+      "event loop"
+     ]
+    },
+    {
+     "label": "no thread per connection / small per-connection state",
+     "patterns": [
+      "no (thread|worker) per connection",
+      "few hundred bytes",
+      "thousands of connections",
+      "does not need a thread"
+     ]
+    },
+    {
+     "label": "heavy work handed to upstream",
+     "patterns": [
+      "upstream",
+      "php-fpm",
+      "app server"
+     ]
+    }
+   ],
+   "modelAnswer": "A master process binds the ports, reads nginx.conf and pre-forks one worker process per CPU core (it also respawns and reloads them). Each worker runs a single epoll event loop with timers and multiplexes thousands of connections; a connection needs only a few hundred bytes of state, so there is no thread per connection. Workers only do I/O (accept, read, write, sendfile, caching) and hand heavy work to upstream app servers (PHP-FPM, Gunicorn) over TCP or Unix sockets.\nThread-per-connection needed around 8 MB per thread, so 10,000 connections meant about 80 GB; nginx's memory grows only with the tiny connection state, which is how it solved C10K.",
+   "explanation": "Master + per-core workers, the event loop, why per-connection cost is tiny, and that compute is offloaded.",
+   "id": "L04-s1"
+  },
+  {
+   "q": "What is a cache stampede (thundering herd on a cache), and how does nginx's proxy_cache_lock address it? State its default and a limitation.",
+   "checks": [
+    {
+     "label": "entry expires or misses",
+     "patterns": [
+      "expir",
+      "miss"
+     ]
+    },
+    {
+     "label": "many requests hit upstream",
+     "patterns": [
+      "upstream",
+      "origin",
+      "backend"
+     ]
+    },
+    {
+     "label": "lock per key; one request fetches",
+     "patterns": [
+      "lock"
+     ]
+    },
+    {
+     "label": "others wait and are served from cache",
+     "patterns": [
+      "wait"
+     ]
+    },
+    {
+     "label": "off by default",
+     "patterns": [
+      "off by default",
+      "not (on|enabled) by default",
+      "default.{0,20}off"
+     ]
+    },
+    {
+     "label": "only within one machine",
+     "patterns": [
+      "one machine",
+      "single (machine|server)",
+      "across (multiple )?(machines|servers)"
+     ]
+    }
+   ],
+   "modelAnswer": "When a popular cached entry expires (or is missing), every request that arrives at that moment is a cache miss, and all of them are forwarded to the upstream at once, potentially overwhelming it. nginx workers are separate processes with their own event loops, so they cannot see that the others are fetching the same object.\nproxy_cache_lock adds a lock per cache key in the shared cache metadata: the first request fetches from the upstream, the others wait and are then served from the refreshed cache. It is off by default, so you must enable it. Limitation: it only coordinates workers on one machine; across multiple servers you need a distributed solution.",
+   "explanation": "Must name the cause (simultaneous misses), the mechanism (per-key lock, others wait), the default (off) and the one-machine scope.",
+   "id": "L04-s2"
+  },
+  {
+   "q": "Compare select and epoll for a server with 10,000 mostly idle connections.",
+   "checks": [
+    {
+     "label": "select scans all descriptors / O(n)",
+     "patterns": [
+      "scan",
+      "o\\(n\\)",
+      "every descriptor",
+      "all 10,?000"
+     ]
+    },
+    {
+     "label": "epoll returns only ready descriptors",
+     "patterns": [
+      "only (the )?(ready|active)"
+     ]
+    },
+    {
+     "label": "select limit 1024",
+     "patterns": [
+      "1024",
+      "fd_setsize"
+     ]
+    },
+    {
+     "label": "select rebuilds set; epoll registers once",
+     "patterns": [
+      "rebuil",
+      "register(ed)? once",
+      "epoll_ctl"
+     ]
+    },
+    {
+     "label": "epoll Linux-only / kqueue",
+     "patterns": [
+      "linux",
+      "kqueue"
+     ]
+    }
+   ],
+   "modelAnswer": "select: you rebuild the fd_set before every call, the kernel checks every registered descriptor, and when it returns you scan all of them with FD_ISSET, so each wake-up costs O(n) even if only 10 of 10,000 are active. It is also capped at FD_SETSIZE = 1024 descriptors by default, so 10,000 does not even fit.\nepoll: descriptors are registered once with epoll_ctl, and epoll_wait returns only the ready ones, so the cost is proportional to activity and idle connections are nearly free. epoll is Linux-only; BSD/macOS use kqueue.",
+   "explanation": "The core contrast is O(all) scanning vs O(ready) results, plus the 1024 cap and portability.",
+   "id": "L04-s3"
+  },
+  {
+   "q": "Work out what htons(2026) gives on a little-endian x86 machine, showing the steps, and say what is actually sent on the wire.",
+   "checks": [
+    {
+     "label": "2026 = 0x07EA",
+     "patterns": [
+      "0x07ea",
+      "07 ?ea"
+     ]
+    },
+    {
+     "label": "swapped to 0xEA07",
+     "patterns": [
+      "0xea07",
+      "ea ?07"
+     ]
+    },
+    {
+     "label": "59911",
+     "patterns": [
+      "59911",
+      "59,911"
+     ]
+    },
+    {
+     "label": "big-endian network order / little-endian host",
+     "patterns": [
+      "big.?endian",
+      "little.?endian",
+      "network byte order"
+     ]
+    }
+   ],
+   "modelAnswer": "2026 in hex is 0x07EA (needs only 11 bits, two bytes: 07 and EA).\nNetwork byte order is big-endian, so the wire must carry 07 then EA. x86 is little-endian and stores integers low byte first, so htons swaps the two bytes.\nIf you print the result as a host integer you see 0xEA07 = 14*4096 + 10*256 + 0*16 + 7 = 59911.\nOn the wire the bytes are 07 EA, i.e. 2026 in big-endian order.",
+   "explanation": "Hex conversion, the byte swap, the decimal value, and the distinction between printed value and wire bytes.",
+   "id": "L04-s4"
+  },
+  {
+   "q": "Explain how nginx serves a static file with sendfile versus read/write, and when sendfile cannot be used.",
+   "checks": [
+    {
+     "label": "read/write copies into user space and back",
+     "patterns": [
+      "user.?space",
+      "user buffer"
+     ]
+    },
+    {
+     "label": "mentions copies",
+     "patterns": [
+      "cop(y|ies)"
+     ]
+    },
+    {
+     "label": "sendfile: kernel sends file to socket directly",
+     "patterns": [
+      "sendfile"
+     ]
+    },
+    {
+     "label": "page cache / kernel",
+     "patterns": [
+      "kernel",
+      "page cache"
+     ]
+    },
+    {
+     "label": "cannot use when compressing/modifying",
+     "patterns": [
+      "gzip",
+      "compress",
+      "modif"
+     ]
+    }
+   ],
+   "modelAnswer": "With read/write, the file data goes disk -> kernel page cache -> copied into a user-space buffer by read() -> copied back into the kernel socket buffer by write() -> NIC: two copies and extra user-kernel crossings for data the program never looks at.\nWith sendfile, nginx writes the HTTP headers and blank line to the socket, then calls sendfile(socket, file), and the kernel moves the bytes from the page cache to the socket directly, with no user-space copy.\nIt cannot help when the body must be gzip-compressed or otherwise modified first, because the bytes have to be in user space for that. Its benefit is small in a loopback test but large at high concurrency.",
+   "explanation": "Describe the copy path, the zero-copy alternative, and the transformation limitation.",
+   "id": "L04-s5"
+  },
+  {
+   "q": "Write an nginx configuration that sends /api/ to two backends with a 3:1 traffic split plus a static fallback server that is used only if both fail, and serves other paths WordPress-style.",
+   "checks": [
+    {
+     "label": "upstream block",
+     "patterns": [
+      "upstream"
+     ]
+    },
+    {
+     "label": "weights 3 and 1",
+     "patterns": [
+      "weight=3"
+     ]
+    },
+    {
+     "label": "backup server",
+     "patterns": [
+      "backup"
+     ]
+    },
+    {
+     "label": "proxy_pass to the upstream",
+     "patterns": [
+      "proxy_pass"
+     ]
+    },
+    {
+     "label": "try_files fallback to index.php",
+     "patterns": [
+      "try_files"
+     ]
+    }
+   ],
+   "modelAnswer": "upstream api_pool {\n    server 10.0.0.11 weight=3;\n    server 10.0.0.12 weight=1;\n    server 10.0.0.99 backup;   # static fallback, only used when the others are down\n}\nserver {\n    listen 80;\n    server_name example.com;\n    location /api/ {\n        proxy_pass http://api_pool;\n    }\n    location / {\n        try_files $uri $uri/ /index.php?$args;\n    }\n}\nWeighted round robin sends about 3 of every 4 API requests to the bigger machine; the backup server takes traffic only if both primaries fail; try_files serves existing files and falls back to index.php.",
+   "explanation": "Needs an upstream with weights and a backup, proxy_pass for /api/, and try_files for the fallback.",
+   "id": "L04-s6"
+  },
+  {
+   "q": "A messaging system only allows 26 lowercase letters and space. How many characters fit in 140 bytes with an optimal fixed-width encoding? Show the working.",
+   "checks": [
+    {
+     "label": "27 symbols",
+     "patterns": [
+      "27"
+     ]
+    },
+    {
+     "label": "5 bits per character",
+     "patterns": [
+      "5 bits"
+     ]
+    },
+    {
+     "label": "2^5 = 32",
+     "patterns": [
+      "2\\^5",
+      "32"
+     ]
+    },
+    {
+     "label": "1120 bits",
+     "patterns": [
+      "1,?120"
+     ]
+    },
+    {
+     "label": "224 characters",
+     "patterns": [
+      "224"
+     ]
+    }
+   ],
+   "modelAnswer": "There are 27 possible symbols. 4 bits give only 16 values, too few; 5 bits give 2^5 = 32 >= 27, so 5 bits per character suffice.\n140 bytes = 140 x 8 = 1120 bits.\n1120 / 5 = 224 characters, compared with 140 characters at 8 bits each (or 160 with 7-bit SMS encoding).",
+   "explanation": "Find the minimum bits with log2 reasoning, convert bytes to bits, divide.",
+   "id": "L04-s7"
+  }
+ ],
+ "subtitle": "",
+ "quiz": [
+  {
+   "quiz": 1,
+   "qn": 13,
+   "lecture": 4,
+   "title": "select vs epoll at Scale",
+   "q": "10,000 connections are open and 10 of them have data waiting. How do select and epoll compare?",
+   "options": [
+    "Both do work proportional to the 10 ready descriptors",
+    "select is O(ready) and epoll is O(watched)",
+    "epoll must rebuild its interest set on every call, so it is slower at this scale",
+    "select rebuilds and scans all 10,000 every call; epoll returns only the 10 that fired"
+   ],
+   "answer": 3,
+   "explanation": "With select you rebuild the fd_set before every call, the kernel scans every registered descriptor, and you then loop over all of them with FD_ISSET, so the cost is O(all watched descriptors). With epoll you register descriptors once (epoll_ctl) and epoll_wait() returns only the ready ones. The instructor's exact example: 10,000 idle connections and 10 active, select walks all 10,000 while epoll hands you just the 10.",
+   "distractors": "The other options reverse the truth: select is O(watched), epoll is O(ready), and epoll keeps its interest set in the kernel instead of rebuilding it on each call.",
+   "lectureRef": "epoll vs select",
+   "id": "Q1-13",
+   "ref": "<a href=\"../lectures/lecture-04.html#n-epoll-vs-select\">Lecture 4: epoll vs select</a>"
+  },
+  {
+   "quiz": 1,
+   "qn": 19,
+   "lecture": 4,
+   "title": "sendfile vs gzip",
+   "q": "sendfile on; and gzip on; fight each other. Why?",
+   "options": [
+    "sendfile copies entirely kernel-side, so to compress (or encrypt) the bytes they must be brought into user space",
+    "sendfile only works on files smaller than 64 KiB, and gzip buffers more than that",
+    "gzip needs the file mmap'd, which sendfile forbids",
+    "sendfile cannot set Content-Length, which gzip requires"
+   ],
+   "answer": 0,
+   "explanation": "sendfile() moves bytes straight from the kernel page cache to the socket buffer with no copy into user space; that is its whole benefit. gzip (or TLS encryption) has to transform the bytes, which can only happen in user space, so nginx must read the data up anyway and the zero-copy advantage is lost for compressed responses.",
+   "distractors": "sendfile has no 64 KiB limit, gzip does not require mmap, and sendfile is unrelated to Content-Length (headers are written before the body).",
+   "lectureRef": "sendfile, the page cache and mmap",
+   "id": "Q1-19",
+   "ref": "<a href=\"../lectures/lecture-04.html#n-sendfile-the-page-cache-and-mmap\">Lecture 4: sendfile, the page cache and mmap</a>"
+  },
+  {
+   "quiz": 1,
+   "qn": 20,
+   "lecture": 4,
+   "title": "try_files Fallback",
+   "q": "For try_files $uri $uri/ /index.html?$args;, what is the role of the final argument?",
+   "options": [
+    "It is tested like the others, and returns 404 if missing",
+    "It is the fallback — the only entry that is never tested as a file",
+    "It is tested first, so a real /index.html short-circuits the rest",
+    "It is ignored unless error_page is also configured"
+   ],
+   "answer": 1,
+   "explanation": "try_files checks each argument in order as a file or directory ($uri, then $uri/) and serves the first that exists. The last argument is different: it is never tested, it is the fallback, an internal redirect taken when nothing else matched. That is the WordPress/SPA pattern from the lecture: serve the real file if it exists, otherwise send the request to index.php (or index.html) to decide.",
+   "distractors": "The last argument is not tested and does not return 404 on its own, it is checked last rather than first, and it works without error_page.",
+   "lectureRef": "Load balancing and fallbacks",
+   "id": "Q1-20",
+   "ref": "<a href=\"../lectures/lecture-04.html#n-load-balancing-and-fallbacks\">Lecture 4: Load balancing and fallbacks</a>"
+  },
+  {
+   "quiz": 1,
+   "qn": 21,
+   "lecture": 4,
+   "title": "Efficient Encoding for Game Commands",
+   "q": "You want to send up/down/left/right and space keys on a gaming protocol. Which of these encodings sends those commands most efficiently?",
+   "options": [
+    "7-bit",
+    "BCD",
+    "Base64",
+    "Base32"
+   ],
+   "answer": 1,
+   "explanation": "Five commands (up, down, left, right, space) need only 3 bits each (2^3 = 8 >= 5). Of the options, BCD packs one symbol into a 4-bit nibble, so two commands fit in a byte. That is the closest to 3 bits and the most compact. The lecture's packing rule: use the fewest bits that cover your symbol set (27 symbols need 5 bits, GSM needs 7).",
+   "distractors": "7-bit codes spend 7 bits per command, and Base64/Base32 are text-safe encodings that send each 6- or 5-bit group as a full 8-bit character, so they are larger, not smaller.",
+   "lectureRef": "End-of-class quiz: Base64 and compact encodings",
+   "keyNote": "BCD is designed for decimal digits rather than command codes, so the deeper idea is 'use the smallest fixed-width code that covers your symbols' (a custom 3-bit code would be smaller still). Among the four options given, the 4-bit BCD nibble is the most compact, which is why it is the official answer.",
+   "id": "Q1-21",
+   "ref": "<a href=\"../lectures/lecture-04.html#n-end-of-class-quiz-base64-and-compact-encodings\">Lecture 4: End-of-class quiz: Base64 and compact encodings</a>"
+  },
+  {
+   "quiz": 1,
+   "qn": 24,
+   "lecture": 4,
+   "title": "Output of htons(2026)",
+   "q": "What would be the output of htons(2026)?",
+   "options": [
+    "2026",
+    "59911",
+    "10000",
+    "2620"
+   ],
+   "answer": 1,
+   "explanation": "2026 = 0x07EA. On a little-endian x86 host, htons() swaps the two bytes to produce 0xEA07, so that the wire carries 07 EA. If you print that result as a host integer you get 0xEA07 = 234 x 256 + 7 = 59911.",
+   "distractors": "2026 would only be the output on a big-endian host (where htons does nothing); 10000 and 2620 do not correspond to any byte arrangement of 0x07EA.",
+   "lectureRef": "Warm-up quiz: byte order, framing, fork and friends",
+   "id": "Q1-24",
+   "ref": "<a href=\"../lectures/lecture-04.html#n-warm-up-quiz-byte-order-framing-fork-and-friends\">Lecture 4: Warm-up quiz: byte order, framing, fork and friends</a>"
+  },
+  {
+   "quiz": 2,
+   "qn": 6,
+   "lecture": 4,
+   "title": "Why Thread-per-Client Stopped Scaling",
+   "q": "Why did thread-per-client designs lose out at scale, motivating select()/epoll instead?",
+   "options": [
+    "Threads cannot open network sockets",
+    "Each thread reserves a stack (~8 MB by default)",
+    "Threads cannot coexist with fork()",
+    "The OS limits every process to 100 threads"
+   ],
+   "answer": 1,
+   "explanation": "Every OS thread reserves its own stack, about 8 MB by default. The lecture's C10K arithmetic: 10,000 connections x 8 MB = 80 GB of memory, so thread-per-client could not scale. Event loops (select, then epoll) serve thousands of connections from one thread, where each connection costs only a few hundred bytes of state.",
+   "distractors": "Threads can open sockets, threads and fork() coexist, and there is no 100-thread limit per process.",
+   "lectureRef": "History: from Apache's fork to nginx",
+   "id": "Q2-6",
+   "ref": "<a href=\"../lectures/lecture-04.html#n-history-from-apache-s-fork-to-nginx\">Lecture 4: History: from Apache&#x27;s fork to nginx</a>"
+  },
+  {
+   "quiz": 2,
+   "qn": 9,
+   "lecture": 4,
+   "title": "The Question nginx Asked",
+   "q": "Instead of trying to make each worker cheaper, what question did nginx's architecture ask that Apache's decade of MPM tuning hadn't?",
+   "options": [
+    "Why not use more RAM per worker?",
+    "Why is there a worker per connection?",
+    "Why not skip TCP entirely?",
+    "Why not require HTTPS everywhere?"
+   ],
+   "answer": 1,
+   "explanation": "Apache spent years making a worker per connection cheaper (fork, pre-fork, MPMs, threads). nginx asked instead, 'why does a connection need a worker at all?' A connection only needs a few hundred bytes of state; only work needs a thread. So nginx runs one event loop per core doing I/O and hands the heavy work to upstream app servers.",
+   "distractors": "More RAM per worker is the old approach, nginx still uses TCP, and HTTPS has nothing to do with its architecture.",
+   "lectureRef": "nginx's key idea: change the question",
+   "id": "Q2-9",
+   "ref": "<a href=\"../lectures/lecture-04.html#n-nginx-s-key-idea-change-the-question\">Lecture 4: nginx&#x27;s key idea: change the question</a>"
+  },
+  {
+   "quiz": 2,
+   "qn": 10,
+   "lecture": 4,
+   "title": "Why sendfile and gzip Conflict",
+   "q": "sendfile on; and gzip on; conflict with each other in nginx. Why?",
+   "options": [
+    "sendfile copies data in the kernel without userspace, but gzip happens in userspace",
+    "gzip disables the sendfile syscall permanently once loaded",
+    "sendfile only works over UDP",
+    "gzip requires TLS to be disabled first"
+   ],
+   "answer": 0,
+   "explanation": "sendfile() moves file data from the kernel page cache to the socket without ever copying it into user space. gzip compresses in user space, so the bytes must be brought up from the kernel anyway, and the zero-copy benefit disappears for compressed responses.",
+   "distractors": "gzip does not disable sendfile permanently, sendfile has nothing to do with UDP, and gzip does not depend on TLS.",
+   "lectureRef": "sendfile, the page cache and mmap",
+   "id": "Q2-10",
+   "ref": "<a href=\"../lectures/lecture-04.html#n-sendfile-the-page-cache-and-mmap\">Lecture 4: sendfile, the page cache and mmap</a>"
+  },
+  {
+   "quiz": 2,
+   "qn": 11,
+   "lecture": 4,
+   "title": "Location Matching Precedence",
+   "q": "A config has both location ^~ /images/ and location ~ \\.php$. Which one serves a request for /images/logo.php?",
+   "options": [
+    "The regex location, because regex always wins ties",
+    "^~ stops nginx from checking the regex locations once it matches",
+    "Neither — nginx returns 404",
+    "Whichever is declared first in the file"
+   ],
+   "answer": 1,
+   "explanation": "nginx first finds the longest matching prefix location. If that prefix is marked ^~, nginx uses it immediately and does not test any regex locations. /images/logo.php matches the prefix ^~ /images/, so the \\.php$ regex is never checked.",
+   "distractors": "Regex locations only win when the longest prefix lacks ^~, the request is served (not 404), and declaration order matters only between regexes.",
+   "lectureRef": "location matching and the data structures behind it",
+   "id": "Q2-11",
+   "ref": "<a href=\"../lectures/lecture-04.html#n-location-matching-and-the-data-structures-behind-it\">Lecture 4: location matching and the data structures behind it</a>"
+  },
+  {
+   "quiz": 2,
+   "qn": 12,
+   "lecture": 4,
+   "title": "What keys_zone Holds",
+   "q": "In proxy_cache_path ... keys_zone=demo:10m max_size=100m;, what does the 10m of keys_zone actually hold?",
+   "options": [
+    "The cached response bodies themselves",
+    "A hash of the nginx config file",
+    "An in-memory index of cache keys and metadata",
+    "The upstream server's TLS certificate cache"
+   ],
+   "answer": 2,
+   "explanation": "keys_zone=demo:10m sizes a shared-memory zone that holds the cache index: the keys and their metadata. The cached response bodies live on disk under the cache path, limited by max_size=100m with LRU eviction. The lecture compared it to a database index pointing at the real data.",
+   "distractors": "The bodies are on disk (bounded by max_size), and keys_zone has nothing to do with config hashes or TLS certificates.",
+   "lectureRef": "Caching in nginx",
+   "id": "Q2-12",
+   "ref": "<a href=\"../lectures/lecture-04.html#n-caching-in-nginx\">Lecture 4: Caching in nginx</a>"
+  }
+ ],
+ "prev": {
+  "num": 3,
+  "file": "lecture-03.html"
+ },
+ "next": {
+  "num": 5,
+  "file": "lecture-05.html"
+ }
+};

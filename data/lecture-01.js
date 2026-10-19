@@ -1,0 +1,883 @@
+window.PAGE = {
+ "num": 1,
+ "title": "Network programming 101",
+ "summary": "Builds a TCP echo server and client in C from the socket system calls (socket, bind, listen, accept, read/write, close) and uses them to explain ports, byte order, the listen backlog, signals such as SIGPIPE, DNS from a programmer's view, and concurrency with fork, threads and pools. It ends with protocol design: framing (fixed, delimiter, TLV), text vs binary, Base64, ASN.1/protobuf and RPC/gRPC.",
+ "notes": [
+  {
+   "heading": "Why fundamentals, and the course roadmap",
+   "body": "The instructor (20+ years as a software engineer) opened by arguing that fundamentals still matter even when frameworks and AI tools write most of the code: if you know what is underneath and what its limits are, you can debug it, size it and improve it.\n\nThe course arc he laid out:\n\n1. Network programming: the handful of socket system calls every server uses.\n2. A light pass over OSI, packet sniffing and designing your own protocol.\n3. Scale: what servers do when there are many clients.\n4. nginx in depth.\n5. HTTP and its history.\n6. CDNs.\n7. The economics of cloud (\"solutions must be practical, and practical means somebody has to make money\").\n8. Building for failures (this lecture skips error handling on purpose; that lecture comes back to it).\n\nExamples are in **C** because higher-level languages (Java, Python, JavaScript) hide the system calls. The homework is to compile the C examples and **port them to your favourite language**, so you can see how much the language does for you."
+  },
+  {
+   "heading": "The server lifecycle: socket, bind, listen, accept, read/write, close",
+   "body": "Every TCP server, whether Express, Flask, Spring or nginx, makes the same system calls underneath. When you write `app.listen(3000)`, socket, bind and listen have already happened for you, and the framework sits in an accept loop.\n\n```\nSERVER                         CLIENT\nsocket()                       socket()\nbind(ip, port)                 (bind optional)\nlisten(backlog)\naccept()   <---- 3-way ----    connect(server_ip, port)\nread()/recv()  <-------------  write()/send()\nwrite()/send() ------------->  read()/recv()\nclose()                        close()\n```\n\n- `socket(AF_INET, SOCK_STREAM, 0)` creates the endpoint and returns a **file descriptor**. `AF_INET` = IPv4 address family (`AF_INET6` for IPv6, `AF_UNIX` for local sockets). `SOCK_STREAM` = TCP (reliable byte stream). `SOCK_DGRAM` = UDP (datagrams). `SOCK_RAW` = raw packets (used by sniffers).\n- `bind()` reserves an IP + port for this process: \"if anybody wants to reach me, this is where I am\".\n- `listen(fd, backlog)` marks the socket passive and sets the size of the queue of pending connections.\n- `accept()` blocks until a client finishes the handshake, then returns a **new** socket for that client. The listening socket stays open for the next one.\n- `read`/`write` (or `recv`/`send`) move bytes. They are the same calls used for files.\n- `close()` tears down the connection.\n\nUse the **man pages** (`man 2 socket`, `man 2 bind`) to see every option and error code of a system call."
+  },
+  {
+   "heading": "Addresses, INADDR_ANY and byte order (htons/htonl)",
+   "body": "The server fills a `struct sockaddr_in`:\n\n```c\nstruct sockaddr_in addr;\naddr.sin_family      = AF_INET;            // IPv4\naddr.sin_addr.s_addr = htonl(INADDR_ANY);  // 0.0.0.0 = every interface\naddr.sin_port        = htons(8080);        // port, in network byte order\nbind(server_fd, (struct sockaddr*)&addr, sizeof(addr));\n```\n\n- **INADDR_ANY (0.0.0.0)** means \"accept connections arriving on any IP this machine has\" (Wi-Fi, Ethernet, loopback). Binding to `127.0.0.1` would allow only local clients.\n- **IP address** locates the machine; **port** locates the process on that machine.\n\n### Byte order\nNetworks (the TCP/IP headers) use **big-endian**, the most significant byte first, called **network byte order**. Intel x86 (and ARM as usually configured) store integers **little-endian**. So every multi-byte number put in a header must be converted:\n\n| Function | Meaning | Size |\n|---|---|---|\n| `htons` | host to network, short | 2 bytes (ports) |\n| `htonl` | host to network, long | 4 bytes (IPv4 addresses) |\n| `ntohs` / `ntohl` | network to host | 2 / 4 bytes |\n\nExample: the 4-byte value `0x0A0B0C0D` is stored in memory as `0D 0C 0B 0A` on a little-endian machine but goes on the wire as `0A 0B 0C 0D`. On a big-endian host these functions do nothing. Frameworks hide this from you, but it is there."
+  },
+  {
+   "heading": "Ports: range, privileged ports and famous numbers",
+   "body": "- A port is an unsigned **16-bit** number, so there are **2^16 = 65,536** values (0 to 65535). The instructor used this to stress knowing data sizes: sizing comes back in the cloud-economics lecture, and the same \"fewer bits\" idea is behind model quantization.\n- **Ports below 1024 are privileged** on Linux/Unix: only root can bind them. Changing the demo server's port to 50 fails as a normal user. Above 1024 anyone can bind.\n- If another process already holds the port, `bind()` fails with **\"Address already in use\"** (`EADDRINUSE`). Two processes cannot both bind the same IP:port (without special options).\n\n| Port | Protocol |\n|---|---|\n| 80 | HTTP (the most famous) |\n| 443 | HTTPS (the most *used* today) |\n| 25 | SMTP (server-to-server mail, unencrypted) |\n| 465 / 587 | SMTP over TLS / mail submission with STARTTLS |\n| 110 / 995 | POP3 / POP3S |\n| 143 / 993 | IMAP / IMAPS |\n| 119 | NNTP (Usenet newsgroups) |\n| 22 | SSH |\n| 53 | DNS |\n| 8080, 3000, 8000 | common development ports |\n\nTo read Gmail from your own program you either use Google's APIs or speak **IMAP**. **NNTP** carried Usenet **newsgroups**, where the early internet held its announcements and long flame-war debates. Google Groups grew out of them."
+  },
+  {
+   "heading": "What happens on a closed port, the backlog queue, and the echo demo",
+   "body": "### Connecting to a port nobody has bound\nThe OS replies with a TCP **RST** and the client sees **\"Connection refused\"**. Other systems behave differently. Many firewalls, CDNs and hardened hosts **silently drop** the packet, so the client just times out. This defends against **port scanning**: attackers sweep all ~65k ports looking for an exposed Express, PM2 or database, and a refusal at least confirms that the host exists.\n\n### The demo: an iterative echo server\nThe server accepts a client, reads, and writes the same bytes back (echo). The client is **`nc` (netcat)**, which is \"cat over the network\": `nc localhost 8080`. Whatever you type is echoed back.\n\n### The listen backlog\nWith `listen(fd, 1)` and a single-threaded loop:\n\n1. Client 1 is accepted and served.\n2. Client 2 connects. The kernel completes the handshake, puts it in the **backlog queue** and waits there. Nothing is echoed.\n3. Client 3 can find the queue full, and on Linux its SYN is ignored, so it hangs or retries.\n4. When client 1 disconnects, the loop calls accept() again and client 2 is served.\n\nThe backlog is a queue that the kernel manages. Linux caps it at `net.core.somaxconn` (defaults are on the order of 4096 on modern kernels). Production servers set it to thousands.\n\n**Beyond the lecture:** on Linux the backlog counts fully established connections waiting for accept(). Half-open SYN_RECEIVED connections sit in a separate SYN queue."
+  },
+  {
+   "heading": "Signals, SIGPIPE and exit codes",
+   "body": "If the server writes to a client that has gone away (closed browser tab, phone scrolled off), the kernel sends the process **SIGPIPE**: \"you wrote to a pipe/socket whose other end is closed\". By default this kills the process **silently**, which is why the demo server just died. The instructor's demo client did read, sleep, write, and running it showed this.\n\n- Exit status convention: **0 = success**, non-zero = failure (check with `echo $?`).\n- If a process is killed by a signal, the shell reports **128 + signal number**. SIGPIPE is signal 13, so **141**.\n\n| Signal | No. | Typical use |\n|---|---|---|\n| SIGHUP | 1 | \"hang up\": terminal/SSH closed; daemons abuse it to **reload configuration** (nginx -s reload) |\n| SIGINT | 2 | Ctrl-C |\n| SIGKILL | 9 | `kill -9`: cannot be caught, no cleanup |\n| SIGPIPE | 13 | write to a closed socket/pipe |\n| SIGTERM | 15 | default of `kill`: polite stop, the program can clean up |\n\nServers usually ignore SIGPIPE (or use `MSG_NOSIGNAL`) and handle the `EPIPE` error instead. The instructor recommended learning some shell scripting and reading about signals."
+  },
+  {
+   "heading": "The client side and ephemeral ports",
+   "body": "A client needs only `socket()` and then `connect(server_ip, port)`, followed by write/read and close. There is **no bind, listen or accept**.\n\n- **bind is optional for clients.** If you don't bind, the OS picks a temporary **ephemeral port** at connect time. On Linux the range is set by `net.ipv4.ip_local_port_range`, roughly 32768–60999, about 28k ports.\n- You will usually write far more servers than clients, because clients are hidden inside libraries (`fetch`, HTTP client libraries, DB drivers).\n- Your existing tools are clients already: `nc`/`telnet` for plain TCP, `openssl s_client -connect host:443` for TLS, `curl` for HTTP.\n\n### TIME_WAIT\nAfter a connection closes, the side that closed first keeps it in **TIME_WAIT** for 2×MSL, which is **about 60 seconds** on most Linux systems. This lets stray packets of the old connection die and gives a lost final ACK the chance to be resent. `lsof -i` or `ss -tan` shows many such sockets on a busy machine. Because each one ties up an ephemeral port, a client making very many short connections can run out of ports."
+  },
+  {
+   "heading": "Talking text protocols by hand: HTTP, SMTP, CRLF",
+   "body": "Many classic protocols are **plain text**, so you can type them by hand:\n\n```\n$ nc example.com 80\nGET / HTTP/1.0\nHost: example.com\n                         <- blank line ends the headers\nHTTP/1.0 200 OK\n...\n```\n\n- Lines end with **CRLF** (`\\r\\n`, carriage return + line feed). The name comes from typewriters: you **returned the carriage** to the left margin, and the **line feed** rolled the paper up one line. Computers kept both characters and some systems copied the convention inconsistently.\n- The request ends with **two CRLFs** (an empty line), which tells the server the headers are finished. That is why you press Enter twice.\n- Many sites answer port 80 with a **redirect (301/302) to HTTPS**. For 443 you need a TLS client: `openssl s_client -connect google.com:443`.\n- **SMTP by hand**: `HELO`/`EHLO` (the greeting), `MAIL FROM:`, `RCPT TO:`, `DATA`, the message, a line with a single `.`, then `QUIT`. Before spam controls (SPF, DKIM, authentication) you could forge a sender this way. The instructor once sent his professor a mail \"from the professor's own ID\".\n- Some protocols are **not** text: PostgreSQL's wire protocol, Kafka and SSH are binary.\n\n### curl\n- `curl -v URL` shows the request and response headers, the TLS handshake and the resolved IPs.\n- `curl -I` sends a HEAD request (headers only).\n- curl negotiates HTTP/2 when it can. You can force `--http1.1`, change the method with `-X`, and add headers with `-H`.\n- `2>&1` redirects stderr (fd 2) into stdout (fd 1), so that `-v` output can be piped to grep.\n\nHTTP/1.0 is specified in **RFC 1945**. RFCs are free on rfc-editor.org/ietf.org and are \"one of the best ways to understand protocols deeply\"."
+  },
+  {
+   "heading": "DNS from a programmer's view: /etc/hosts, size limits, TTL",
+   "body": "`gethostbyname()` is the old, obsolete call. **`getaddrinfo()`** is the current one. Given a host name it returns the IPs you then connect() to. Programs often cache the result.\n\n- Lookup order: the resolver checks **`/etc/hosts` first**, then DNS. Editing /etc/hosts can point google.com anywhere on your machine, which is the same idea that DNS hijacking abuses on a larger scale.\n- **localhost is a host name, not an IP.** It maps to 127.0.0.1 (::1 for IPv6) through /etc/hosts. Famous public resolvers: **8.8.8.8** (Google) and **1.1.1.1** (Cloudflare).\n- **Root servers** sit at the top of the hierarchy, operated by a fixed set of organisations.\n\n### War story: the truncated DNS response\nUsers in one housing society suddenly couldn't open the site. The company's DNS answers carried **many IPs**, to localise and spread traffic, so the responses were large. The society's ISP used very old routers that **truncated or dropped large DNS (UDP) responses**. The fix was to return **fewer IPs per response**, with a workaround of using a different resolver. **Beyond the lecture:** classic DNS over UDP is limited to **512 bytes** (EDNS0 raises this). Larger answers set the TC (truncated) bit and the client should retry over **TCP port 53**.\n\n### TTL (time to live)\nResolvers, ISPs and browsers cache a record for its TTL. Common values are hours (a 24h TTL is typical) or **5 minutes or less** when you need fast rotation. Long TTLs bite during migrations, so the safe procedure is:\n\n1. **Lower the TTL** (say to 5 minutes) well ahead of time.\n2. Wait at least the **old** TTL so every cache picks up the short one.\n3. Change the IP. Old caches now expire within minutes.\n4. Keep the old server running a few days for stragglers, then raise the TTL again."
+  },
+  {
+   "heading": "OSI layers and L4 vs L7 load balancers",
+   "body": "Where our socket code sits:\n\n| Layer | Name | Example |\n|---|---|---|\n| 7 | Application | HTTP, SMTP, DNS, our echo protocol |\n| 6 | Presentation | encoding, encryption (rarely separate) |\n| 5 | Session | (rarely separate) |\n| 4 | Transport | TCP, UDP (ports) |\n| 3 | Network | IP (addresses, routing) |\n| 2 | Data link | Ethernet, Wi-Fi MAC |\n| 1 | Physical | cables, radio, the USB-C Ethernet adapter |\n\nHardware is layer 1, its driver handles layer 2, and the same TCP/IP stack runs on top whatever the medium. The instructor praised the layering: getting abstraction boundaries right is very hard, and when it works, as here, TLS can be dropped on top of TCP and mail on top of TLS. In practice layers 5 and 6 get merged into 7, so some people describe a **5-layer** (TCP/IP) model.\n\n### L4 vs L7 load balancers\n- An **L4 load balancer** is \"dumb\": it sees only IPs and ports and forwards TCP/UDP connections to backends without understanding the protocol. It is fast and cheap.\n- An **L7 load balancer** parses the application protocol (HTTP). It can route by path, host or header, terminate TLS, and so on.\n- AWS **ELB** started as a layer-4 balancer and today offers layer 7 too. **Beyond the lecture:** on AWS today the ALB works at L7 and the NLB at L4."
+  },
+  {
+   "heading": "Handling many clients: fork, processes, threads, select",
+   "body": "The iterative server serves one client at a time, because it is stuck inside the read/write loop for that client. A second copy of the program can't help, since its bind() fails with the port in use. The options:\n\n### fork()\n`fork()` creates a **copy of the whole process**: memory, global variables and open file descriptors (including sockets) are all duplicated. Both copies continue from the same line, and you tell them apart by the **return value**:\n\n```c\nint client = accept(server_fd, ...);\npid_t pid = fork();\nif (pid == 0) {          // child\n    close(server_fd);\n    handle(client);      // echo loop\n    exit(0);\n} else {                 // parent (pid = child's PID)\n    close(client);\n    // loop back to accept()\n}\n```\n\n- You use fork every day: the **shell** forks itself and then calls **exec** (`execve`) to replace the copy with `ls`, `cat` and so on. If you `exec` without forking, your shell is replaced and is gone.\n- Chrome's many processes, Apache, nginx worker processes and HAProxy all rely on some form of fork.\n- Parent and child can talk over a **pipe** (`pipe()` gives a read end and a write end). This is **inter-process communication (IPC)**. Parents should `wait()`/`waitpid()` for children to avoid zombies.\n\n### Threads\nThreads share one address space and are cheaper than processes. Chrome started multi-process and added threads. Some languages are weak at threading: Python's GIL means CPU-bound threads don't run in parallel.\n\n### select/poll\nA single thread can watch many sockets at once with **select/poll** (and epoll/kqueue) and handle whichever one is ready, with a timeout. A **client** that talks to several servers at once uses the same mechanism.\n\n### Pools\nForking per request is expensive, so servers **pre-fork** a fixed set of workers or use a **thread pool**. The same idea gives the **DB connection pool**: each web server opens, say, **10** DB connections and reuses them. A request borrows one, returns it, and waits (with locking) if all are busy. That way 100 web servers × 100 concurrent requests don't open 10,000 DB connections."
+  },
+  {
+   "heading": "Limits: file descriptors, C10K, C10M, browser connections, SO_REUSEADDR",
+   "body": "- Each socket is a file descriptor, and processes have a limit, **`ulimit -n`**, which historically defaulted to **1024**.\n- **C10K problem**: serving **10,000 concurrent connections** on one server was once hard, because of fd limits and because a process or thread per connection does not scale. Event-driven servers (select/poll, later epoll) solved it.\n- Today the target is **C10M**. WhatsApp-scale servers held about 2–3 million connections each. The instructor's team handled around 50 million concurrent connections spread across many machines.\n- Browsers limit parallel HTTP/1.1 connections per host. It used to be **2** (from the HTTP/1.1 RFC, to protect servers that forked a process per connection); Chrome now uses **6**.\n- **SO_REUSEADDR**: set it with `setsockopt` before bind so a restarted server can bind again immediately instead of failing with \"address already in use\" while the old connections sit in TIME_WAIT.\n\n```c\nint yes = 1;\nsetsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));\n```"
+  },
+  {
+   "heading": "Packet sniffing and TLS in one minute",
+   "body": "- **tcpdump** captures packets (it needs root, because it uses raw/promiscuous sockets) and can save a **pcap** (packet capture) file. **Wireshark** is the GUI that opens pcap files and decodes every protocol layer.\n- The demo sniffed a plain-text login and the **password showed up in the capture**. Anything not encrypted can be read by anyone on the path.\n- Learn to read hex quickly; it makes debugging much faster. ASCII examples: `A` = 0x41, `a` = 0x61, `0` = 0x30, space = 0x20. Tools print the hex next to the ASCII.\n- Even if a framework (Spring, `fetch`) wraps your sockets, sniffing works whatever the language. You see exactly what crossed the wire.\n\n### TLS/SSL in one minute\n- **Certificate Authorities (CAs)** are trusted companies whose root certificates ship with browsers and operating systems. They sign a server's certificate, which binds its domain to its public key.\n- The handshake uses **asymmetric** (public-key) crypto to authenticate the server and agree on a key, then switches to **symmetric** encryption (for example AES), which is much faster, for the data.\n- The instructor no longer recommends **client certificates** (mutual TLS issued to users), because certificate lifetimes are shrinking fast, toward roughly 50 days, and making every client renew that often would be a nightmare. **Beyond the lecture:** the CA/Browser Forum schedule cuts maximum public TLS certificate lifetime in steps down to **47 days by 2029**, which pushes everyone toward automated renewal (ACME/Let's Encrypt).\n- TLS sits **on top of TCP**, so any TCP protocol can be wrapped in it: HTTPS, SMTPS, IMAPS. This is the layering benefit again."
+  },
+  {
+   "heading": "Designing a protocol: framing, text vs binary, Base64, ASN.1/protobuf, RPC",
+   "body": "A TCP connection delivers a **byte stream** with no message boundaries, so a protocol has to define where one message ends. Three ways:\n\n| Framing | How | Examples |\n|---|---|---|\n| **Fixed length** | every message is N bytes | SS7 MTP (max **272-byte** signal unit), SMS (**140 bytes**), many binary telecom headers |\n| **Delimiter** | a special sequence ends the message | HTTP headers end with CRLF CRLF, SMTP DATA ends with a line containing `.` |\n| **Length-prefixed / TLV** | Type, Length, Value; read L bytes | ASN.1 BER, many binary protocols, HTTP's `Content-Length` |\n\n**SMS puzzle (homework):** how do 160 characters fit in 140 bytes? With **7-bit packing**: 140 × 8 = 1120 bits, and 1120 / 7 = 160 characters.\n\n### Text vs binary\n- Text protocols (HTTP/1.x, SMTP, POP, IMAP, FTP) are easy to read, type and debug with nc and Wireshark.\n- Binary protocols (HTTP/2, HTTP/3, SS7, Postgres, protobuf) are compact and fast for machines to parse. When efficiency on the wire matters you end up binary. JSON is text: fine for browsers, wasteful for machines exchanging it millions of times.\n- Email layers binary on top of text with **MIME**. Gmail's \"Show original\" (raw view) reveals multipart **boundaries**, randomly chosen delimiters that separate the body and each attachment.\n\n### Base64\nBase64 maps every **3 bytes (24 bits)** onto **4 characters** of 6 bits each, drawn from 64 safe characters (A–Z, a–z, 0–9, +, /, with `=` padding). Anything binary can be sent as text this way, but it costs **4/3 the size (about 33% bigger)**. Hex costs 2× (two characters per byte). Try `echo -n hi | base64` and `base64 -d`. You can also define your own alphabet; Base64 is a convention, not magic.\n\n### Schemas: ASN.1, TLV, protobuf\n- **ASN.1** (Abstract Syntax Notation One) is a grammar for messages: field order, types, optional or mandatory, allowed ranges and enums. It can be **nested**. Encoders such as BER/DER write it as TLV. SNMP (network monitoring) and telecom protocols such as MAP (the SMS/roaming protocol) are defined in ASN.1.\n- Plain TLV is simpler (type, length, value, repeated) but flat.\n- **Protocol Buffers** is the modern version: define a schema in `.proto`, and **code generation** produces encode/decode classes. It is binary and compact.\n\n### RPC: calling a function on another machine\n**RPC (Remote Procedure Call)** makes a network call look like a local function call. A generated **stub/proxy** has the same signature, **marshals** (serialises) the arguments, sends them, waits, and **unmarshals** the result.\n\n- Sun RPC came first; then **Java RMI** (Remote Method Invocation).\n- **gRPC** combines three independent standards: **HTTP/2** for transport, **Protocol Buffers** for marshalling, and code-generated stubs. Each piece stands alone: you can use protobuf without gRPC, or HTTP/2 without gRPC.\n- Protobuf is faster and smaller than JSON but not human-readable. For debugging or mocking, you can decode the protobuf from the schema to see or alter what is being sent."
+  },
+  {
+   "heading": "Quick revision",
+   "body": "- Server: socket, bind, listen, accept, read/write, close. Client: socket, connect, read/write, close (bind optional).\n- `AF_INET` = IPv4, `SOCK_STREAM` = TCP, `SOCK_DGRAM` = UDP, `SOCK_RAW` = raw packets.\n- accept() returns a new socket per client; the listening socket keeps listening.\n- INADDR_ANY = 0.0.0.0 = all interfaces; 127.0.0.1 = local only.\n- Network byte order = big-endian; x86 = little-endian; htons (2 B), htonl (4 B).\n- Ports are 16-bit: 65,536 values; under 1024 need root.\n- 80 HTTP, 443 HTTPS, 25 SMTP, 465/587 secure SMTP, 110 POP3, 143 IMAP, 119 NNTP, 53 DNS, 22 SSH.\n- No listener on a port gives RST / \"connection refused\"; firewalls may silently drop instead.\n- The listen backlog queues clients the server hasn't accepted yet.\n- Writing to a closed peer raises SIGPIPE (13) and exit code 141 = 128 + 13.\n- SIGHUP reloads config, SIGTERM (15) is a polite stop, SIGKILL (9) can't be caught.\n- Clients get an OS-assigned ephemeral port.\n- TIME_WAIT lasts about 60 s; SO_REUSEADDR lets a restarted server rebind.\n- HTTP/1.x lines end in CRLF; the headers end with an empty line (CRLF CRLF).\n- getaddrinfo checks /etc/hosts before DNS; classic UDP DNS answers are limited to 512 bytes.\n- Lower the DNS TTL before a migration and wait out the old TTL.\n- L4 LB = IP/port only; L7 LB understands HTTP.\n- fork() returns 0 in the child and the child PID in the parent; the shell does fork + exec.\n- C10K = 10k concurrent connections; the old fd limit was 1024 (`ulimit -n`).\n- Framing: fixed length, delimiter, or length-prefix/TLV.\n- Base64: 3 bytes become 4 chars (+33%); SMS fits 160 7-bit chars in 140 bytes.\n- gRPC = HTTP/2 + protobuf + generated stubs (each usable independently)."
+  },
+  {
+   "heading": "Exam traps",
+   "body": "- **accept() vs connect():** the server accepts and the client connects. accept() returns a *new* fd. Closing the listening fd stops new connections; closing the client fd ends only that client.\n- **bind on clients is optional**, not forbidden. Without it the OS assigns an ephemeral port.\n- **localhost is not an IP**; it is a name that resolves (via /etc/hosts) to 127.0.0.1.\n- **0.0.0.0 vs 127.0.0.1:** 0.0.0.0 exposes the server on every interface; 127.0.0.1 hides it from the network.\n- **Network byte order is big-endian**, not little-endian. htons is for 16-bit ports and htonl for 32-bit IPv4 addresses.\n- **65,536 ports, not 65,535**: values 0 to 65535 (port 0 is reserved/\"pick any\").\n- **\"Connection refused\" means the host answered** (RST). A timeout usually means a firewall dropped the packet or the host is unreachable.\n- **Exit code 141** is not a program bug code; it means killed by signal 13 (SIGPIPE).\n- **SIGKILL cannot be caught**; SIGTERM can. `kill` without a number sends SIGTERM.\n- **Base64 makes data bigger** (4/3), not smaller. Compression is a different thing.\n- **fork copies the process**; it doesn't create a thread. exec *replaces* the process image.\n- **Backlog is not a cap on total clients**; it is the queue of not-yet-accepted connections.\n- **L4 load balancers cannot route by URL path**; that needs L7.\n- **TCP is a byte stream**: one write() isn't guaranteed to arrive as one read(), which is why framing is needed."
+  }
+ ],
+ "keyTerms": [
+  {
+   "term": "Socket",
+   "def": "An OS endpoint for network communication, identified by a file descriptor and bound to an IP + port."
+  },
+  {
+   "term": "File descriptor",
+   "def": "Integer handle the kernel gives for an open file, pipe or socket; read/write work on all of them."
+  },
+  {
+   "term": "AF_INET / SOCK_STREAM / SOCK_DGRAM",
+   "def": "IPv4 address family / TCP byte-stream socket / UDP datagram socket."
+  },
+  {
+   "term": "bind()",
+   "def": "Attaches a socket to a local IP address and port."
+  },
+  {
+   "term": "listen() backlog",
+   "def": "Kernel queue of connections that finished the handshake but haven't been accept()-ed yet."
+  },
+  {
+   "term": "accept()",
+   "def": "Blocks until a client connects and returns a new socket dedicated to that client."
+  },
+  {
+   "term": "INADDR_ANY",
+   "def": "0.0.0.0: bind on every network interface of the machine."
+  },
+  {
+   "term": "Network byte order",
+   "def": "Big-endian (most significant byte first) ordering used in protocol headers."
+  },
+  {
+   "term": "htons / htonl",
+   "def": "Convert 16-bit / 32-bit integers from host byte order to network byte order."
+  },
+  {
+   "term": "Privileged port",
+   "def": "Port below 1024; only root may bind it on Unix-like systems."
+  },
+  {
+   "term": "Ephemeral port",
+   "def": "Temporary client-side port the OS assigns automatically on connect()."
+  },
+  {
+   "term": "SIGPIPE",
+   "def": "Signal 13, sent when writing to a socket/pipe whose reader has closed; kills the process by default (exit 141)."
+  },
+  {
+   "term": "SIGHUP",
+   "def": "Hang-up signal (1); daemons conventionally use it to reload configuration."
+  },
+  {
+   "term": "TIME_WAIT",
+   "def": "State held (~60 s on Linux) by the side that closes first so late packets die out."
+  },
+  {
+   "term": "SO_REUSEADDR",
+   "def": "Socket option that lets a server rebind its port while old connections are in TIME_WAIT."
+  },
+  {
+   "term": "netcat (nc)",
+   "def": "\"cat over the network\": opens raw TCP/UDP connections or listeners from the shell."
+  },
+  {
+   "term": "CRLF",
+   "def": "Carriage return + line feed (\\r\\n), the line terminator in HTTP/SMTP/FTP."
+  },
+  {
+   "term": "getaddrinfo()",
+   "def": "Modern resolver call (replacing gethostbyname) that turns a host name into addresses; consults /etc/hosts then DNS."
+  },
+  {
+   "term": "TTL (DNS)",
+   "def": "How long resolvers may cache a DNS record before asking again."
+  },
+  {
+   "term": "fork()",
+   "def": "Creates a copy of the calling process; returns 0 in the child and the child's PID in the parent."
+  },
+  {
+   "term": "exec",
+   "def": "Replaces the current process image with a new program (shell = fork + exec)."
+  },
+  {
+   "term": "C10K",
+   "def": "The challenge of handling 10,000 concurrent connections on one server."
+  },
+  {
+   "term": "Connection pool",
+   "def": "A fixed set of reusable connections (e.g. to a DB) shared by many requests."
+  },
+  {
+   "term": "L4 vs L7 load balancer",
+   "def": "L4 forwards by IP/port only; L7 parses the application protocol (e.g. HTTP) to route."
+  },
+  {
+   "term": "pcap",
+   "def": "Packet-capture file format written by tcpdump and read by Wireshark."
+  },
+  {
+   "term": "Framing",
+   "def": "How a protocol marks message boundaries: fixed length, delimiter or length prefix (TLV)."
+  },
+  {
+   "term": "TLV",
+   "def": "Type-Length-Value encoding: a type tag, a length, then that many bytes of value."
+  },
+  {
+   "term": "Base64",
+   "def": "Encodes 3 bytes as 4 printable characters (64-symbol alphabet); ~33% size overhead."
+  },
+  {
+   "term": "ASN.1",
+   "def": "Abstract Syntax Notation One: a schema language for (nested) message structures, used by SNMP and telecom."
+  },
+  {
+   "term": "RPC / marshalling",
+   "def": "Calling a remote function via a stub that serialises (marshals) arguments and results."
+  },
+  {
+   "term": "gRPC",
+   "def": "RPC framework combining HTTP/2 transport, Protocol Buffers and generated stubs."
+  }
+ ],
+ "mcqs": [
+  {
+   "q": "Which sequence of system calls does a typical TCP server make before it can exchange data with a client?",
+   "options": [
+    "socket, connect, accept, read",
+    "bind, socket, accept, listen",
+    "socket, bind, listen, accept",
+    "socket, listen, connect, write"
+   ],
+   "answer": 2,
+   "explanation": "A server creates a socket, binds it to an IP:port, marks it passive with listen, and then accept() returns a per-client socket that is used for read/write.",
+   "distractors": "connect() is the client's call, and you cannot bind or listen before a socket exists.",
+   "source": "lecture",
+   "id": "L01-m1"
+  },
+  {
+   "q": "A developer changes the demo echo server to listen on port 50 and runs it as a normal (non-root) Linux user. What happens?",
+   "options": [
+    "bind() fails because ports below 1024 are privileged",
+    "It works; any port up to 65535 is allowed",
+    "listen() fails because the backlog is too small",
+    "It works but only for localhost clients"
+   ],
+   "answer": 0,
+   "explanation": "On Linux/Unix, ports below 1024 are privileged and only root (or a process with CAP_NET_BIND_SERVICE) can bind them, so bind() returns a permission error.",
+   "distractors": "The backlog and the bind address have nothing to do with port privilege.",
+   "source": "lecture",
+   "id": "L01-m2"
+  },
+  {
+   "q": "How many distinct TCP port numbers exist, and why?",
+   "options": [
+    "1,024, because ports are 10-bit",
+    "32,768, because ports are signed 16-bit",
+    "4,294,967,296, because ports are 32-bit",
+    "65,536, because ports are unsigned 16-bit"
+   ],
+   "answer": 3,
+   "explanation": "The port field in the TCP/UDP header is an unsigned 16-bit integer (a 'short'), giving 2^16 = 65,536 values (0 to 65535).",
+   "distractors": "1024 is only the privileged boundary, and ports are neither signed nor 32-bit.",
+   "source": "lecture",
+   "id": "L01-m3"
+  },
+  {
+   "q": "A server binds with `sin_addr = INADDR_ANY`. What does that mean?",
+   "options": [
+    "It accepts connections on any port",
+    "It accepts connections arriving on any of the machine's IP addresses",
+    "It accepts only loopback connections",
+    "The OS picks a random IP for it"
+   ],
+   "answer": 1,
+   "explanation": "INADDR_ANY is 0.0.0.0, meaning 'listen on every interface this machine has'. The port is still the one you specify.",
+   "distractors": "Loopback-only is 127.0.0.1, and the port is set separately via sin_port.",
+   "source": "lecture",
+   "id": "L01-m4"
+  },
+  {
+   "q": "Why must a C program call `htons(8080)` when filling `sin_port`?",
+   "options": [
+    "To encrypt the port number",
+    "Because network byte order is big-endian while x86 hosts are little-endian",
+    "Because ports must be stored as 32-bit values",
+    "To validate that the port is not privileged"
+   ],
+   "answer": 1,
+   "explanation": "Protocol headers use network byte order (big-endian). htons converts the 16-bit host value, which is little-endian on x86, so the bytes go out in the right order.",
+   "distractors": "htons does no encryption or validation, and ports are 16-bit (htons, not htonl).",
+   "source": "lecture",
+   "id": "L01-m5"
+  },
+  {
+   "q": "On a little-endian machine, the 32-bit value 0x0A0B0C0D is stored in memory (lowest address first) as:",
+   "options": [
+    "0A 0B 0C 0D",
+    "0C 0D 0A 0B",
+    "0B 0A 0D 0C",
+    "0D 0C 0B 0A"
+   ],
+   "answer": 3,
+   "explanation": "Little-endian stores the least significant byte first, so memory holds 0D 0C 0B 0A. Network (big-endian) order would be 0A 0B 0C 0D.",
+   "distractors": "0A 0B 0C 0D is big-endian order, and the other two are swapped 16-bit halves, not any standard order.",
+   "source": "lecture",
+   "id": "L01-m6"
+  },
+  {
+   "q": "A client runs `nc server 9000` but nothing is bound to port 9000 on that Linux host, and there is no firewall. What does the client most likely see?",
+   "options": [
+    "Connection refused, because the OS replies with a TCP RST",
+    "The connection hangs forever",
+    "The connection succeeds and data is discarded",
+    "A DNS error"
+   ],
+   "answer": 0,
+   "explanation": "With no listener, the kernel answers the SYN with an RST, which the client reports as 'connection refused'.",
+   "distractors": "A hang means a firewall silently dropped the packet, and DNS is not involved since the host resolved.",
+   "source": "lecture",
+   "id": "L01-m7"
+  },
+  {
+   "q": "An iterative (single-threaded) echo server calls `listen(fd, 1)`. Client A is being served. Client B connects. What happens to B?",
+   "options": [
+    "B is rejected immediately with an error",
+    "B is served in parallel by the kernel",
+    "B's connection waits in the backlog queue until the server calls accept() again",
+    "A is disconnected so B can be served"
+   ],
+   "answer": 2,
+   "explanation": "The kernel completes B's handshake and queues it in the backlog. B gets no echo until A finishes and the loop calls accept().",
+   "distractors": "The kernel never runs application logic in parallel for you, and it doesn't evict existing clients.",
+   "source": "lecture",
+   "id": "L01-m8"
+  },
+  {
+   "q": "A server process dies silently and the shell reports exit status 141. What most likely happened?",
+   "options": [
+    "It ran out of file descriptors",
+    "It was killed with kill -9",
+    "It wrote to a socket whose peer had closed and was killed by SIGPIPE",
+    "It returned 141 from main()"
+   ],
+   "answer": 2,
+   "explanation": "A process killed by a signal reports 128 + signal number. SIGPIPE is 13, so 141. It happens when you write to a closed peer.",
+   "distractors": "kill -9 gives 137 (128+9), and fd exhaustion produces an error return, not a signal.",
+   "source": "lecture",
+   "id": "L01-m9"
+  },
+  {
+   "q": "Which signal do daemons such as nginx conventionally use to reload their configuration without stopping?",
+   "options": [
+    "SIGHUP",
+    "SIGKILL",
+    "SIGPIPE",
+    "SIGSEGV"
+   ],
+   "answer": 0,
+   "explanation": "SIGHUP (hang up) was originally sent when a terminal disconnected. Daemons with no terminal reuse it as a 'reload config' signal.",
+   "distractors": "SIGKILL can't be handled, SIGPIPE is for broken connections, and SIGSEGV is a memory fault.",
+   "source": "lecture",
+   "id": "L01-m10"
+  },
+  {
+   "q": "A TCP client never calls bind(). Which local port does its connection use?",
+   "options": [
+    "Port 0",
+    "The same port as the server",
+    "Port 1024",
+    "An ephemeral port chosen by the OS at connect()"
+   ],
+   "answer": 3,
+   "explanation": "If a client doesn't bind, the kernel assigns a temporary ephemeral port from its local port range when connect() is called.",
+   "distractors": "Port 0 only means 'pick one for me', and reusing the server's port is not how clients work.",
+   "source": "lecture",
+   "id": "L01-m11"
+  },
+  {
+   "q": "You type `GET / HTTP/1.0` into netcat and press Enter once. Nothing comes back. Why?",
+   "options": [
+    "HTTP/1.0 needs TLS",
+    "The server waits for an empty line (CRLF CRLF) marking the end of the headers",
+    "The Host header is mandatory in HTTP/1.0",
+    "netcat cannot send text"
+   ],
+   "answer": 1,
+   "explanation": "HTTP headers are delimiter-framed: an empty line (two consecutive CRLFs) tells the server the request header block is complete.",
+   "distractors": "Host is mandatory in HTTP/1.1, not 1.0, and plain HTTP/1.0 works without TLS.",
+   "source": "lecture",
+   "id": "L01-m12"
+  },
+  {
+   "q": "Your site's DNS A record has a 24-hour TTL and you must move to a new IP with minimal disruption. What is the right plan?",
+   "options": [
+    "Change the IP and lower the TTL at the same time",
+    "Lower the TTL to about 5 minutes, wait at least 24 hours, then change the IP",
+    "Change the IP and restart the DNS server",
+    "Raise the TTL so caches refresh faster"
+   ],
+   "answer": 1,
+   "explanation": "Caches keep the old record for up to the old TTL. Lower the TTL first, wait out the old TTL, and then the IP change spreads within minutes. Keep the old server alive briefly as well.",
+   "distractors": "Changing both at once leaves caches holding the old IP for up to 24h, and a higher TTL makes caching longer, not shorter.",
+   "source": "lecture",
+   "id": "L01-m13"
+  },
+  {
+   "q": "Users behind one old ISP router cannot load a site whose DNS answers contain many IP addresses. Other users are fine. What is the most likely cause?",
+   "options": [
+    "The TTL is too low",
+    "The site's certificate expired",
+    "Port 443 is blocked",
+    "Large UDP DNS responses are being truncated or dropped by old network gear"
+   ],
+   "answer": 3,
+   "explanation": "Classic DNS over UDP assumes answers of 512 bytes or less. Old routers can drop or truncate larger replies. Returning fewer IPs (or falling back to TCP) fixes it.",
+   "distractors": "A low TTL, a blocked port or a certificate problem would not depend on how many IPs the answer contains.",
+   "source": "lecture",
+   "id": "L01-m14"
+  },
+  {
+   "q": "Which load balancer can route `/api/*` to one backend pool and `/static/*` to another?",
+   "options": [
+    "An L7 load balancer",
+    "An L4 load balancer",
+    "Any DNS round-robin",
+    "An L2 switch"
+   ],
+   "answer": 0,
+   "explanation": "Routing by URL path requires parsing HTTP, which only a layer-7 balancer does. L4 sees only IPs and ports.",
+   "distractors": "DNS and L2 switches never see the HTTP path.",
+   "source": "lecture",
+   "id": "L01-m15"
+  },
+  {
+   "q": "In C, after `pid_t pid = fork();` how does the code know it is running in the child?",
+   "options": [
+    "pid is -1",
+    "pid equals getppid()",
+    "pid is 0",
+    "pid is the parent's PID"
+   ],
+   "answer": 2,
+   "explanation": "fork returns 0 in the child and the child's PID (greater than 0) in the parent; -1 means fork failed.",
+   "distractors": "-1 signals an error, and neither return value is the parent's PID.",
+   "source": "lecture",
+   "id": "L01-m16"
+  },
+  {
+   "q": "What was the C10K problem?",
+   "options": [
+    "Encrypting 10 KB messages",
+    "Keeping the DNS TTL under 10 seconds",
+    "Handling 10,000 concurrent connections on a single server",
+    "Supporting more than 10,000 ports"
+   ],
+   "answer": 2,
+   "explanation": "C10K was the challenge of serving ten thousand simultaneous clients on one machine, held back by fd limits (often 1024) and per-connection processes or threads. Event-driven I/O solved it, and today's target is C10M.",
+   "distractors": "It is about concurrency, not message size, DNS or the number of ports.",
+   "source": "lecture",
+   "id": "L01-m17"
+  },
+  {
+   "q": "Roughly how much larger is data after Base64 encoding?",
+   "options": [
+    "About 33% larger (4 bytes out per 3 in)",
+    "Same size",
+    "Twice as large",
+    "About 12.5% larger (8 per 7)"
+   ],
+   "answer": 0,
+   "explanation": "Base64 maps 24 bits (3 bytes) onto 4 six-bit characters, so the output is 4/3 the input.",
+   "distractors": "2× is hex, and 8/7 is the inverse of 7-bit packing.",
+   "source": "lecture",
+   "id": "L01-m18"
+  },
+  {
+   "q": "An SMS payload is 140 bytes, yet you can send 160 characters. How?",
+   "options": [
+    "Compression with gzip",
+    "The extra 20 characters ride in the header",
+    "Characters are sent as Base64",
+    "Each character is packed into 7 bits: 1120 bits / 7 = 160"
+   ],
+   "answer": 3,
+   "explanation": "The GSM default alphabet needs only 7 bits per character. Packing gives 140 × 8 / 7 = 160 characters.",
+   "distractors": "Base64 would make it bigger, gzip is not used, and the header does not carry user text.",
+   "source": "lecture",
+   "id": "L01-m19"
+  },
+  {
+   "q": "Which statement about gRPC is correct?",
+   "options": [
+    "It requires JSON over HTTP/1.1",
+    "It combines HTTP/2 transport with Protocol Buffers marshalling, and each can be used without gRPC",
+    "It is a layer-4 protocol replacing TCP",
+    "Protocol Buffers only works inside gRPC"
+   ],
+   "answer": 1,
+   "explanation": "gRPC stacks independent standards: HTTP/2 for transport, protobuf for serialisation, and generated stubs. Protobuf and HTTP/2 are both used on their own all the time.",
+   "distractors": "gRPC runs on top of TCP via HTTP/2 and does not use JSON.",
+   "source": "lecture",
+   "id": "L01-m20"
+  }
+ ],
+ "short": [
+  {
+   "q": "List, in order, the system calls a TCP echo server makes, and say what each one does. Which of them does a client skip?",
+   "checks": [
+    {
+     "label": "Mentions socket",
+     "patterns": [
+      "socket"
+     ]
+    },
+    {
+     "label": "Mentions bind attaching IP/port",
+     "patterns": [
+      "bind"
+     ]
+    },
+    {
+     "label": "Mentions listen / backlog queue",
+     "patterns": [
+      "listen"
+     ]
+    },
+    {
+     "label": "Mentions accept returning a per-client socket",
+     "patterns": [
+      "accept"
+     ]
+    },
+    {
+     "label": "Mentions read/write (or recv/send) and close",
+     "patterns": [
+      "read|recv|write|send"
+     ]
+    },
+    {
+     "label": "Notes the client uses connect and skips bind/listen/accept",
+     "patterns": [
+      "connect"
+     ]
+    }
+   ],
+   "modelAnswer": "1. socket(AF_INET, SOCK_STREAM, 0): create the endpoint and get a file descriptor.\n2. bind(): attach it to an IP (e.g. INADDR_ANY) and a port (htons(port)).\n3. listen(fd, backlog): mark it passive; the kernel queues completed handshakes in the backlog.\n4. accept(): block until a client is queued and return a NEW socket for that client.\n5. read()/write() (recv/send): echo the bytes back.\n6. close(): close the client socket, then loop back to accept.\nA client only does socket() then connect() (bind is optional, since the OS assigns an ephemeral port), then read/write and close. It skips listen and accept.",
+   "explanation": "The examiner wants the order, the purpose of each call, the fact that accept returns a new socket, and the client/server difference.",
+   "id": "L01-s1"
+  },
+  {
+   "q": "Explain why x86 programs must call htons()/htonl() when filling socket addresses. Use a concrete byte example.",
+   "checks": [
+    {
+     "label": "States network byte order is big-endian",
+     "patterns": [
+      "big.?endian"
+     ]
+    },
+    {
+     "label": "States x86 is little-endian",
+     "patterns": [
+      "little.?endian"
+     ]
+    },
+    {
+     "label": "Gives a byte-level example",
+     "patterns": [
+      "0x|[0-9a-f]{2} [0-9a-f]{2}"
+     ]
+    },
+    {
+     "label": "Distinguishes htons (16-bit/port) from htonl (32-bit/address)",
+     "patterns": [
+      "16.?bit|2.?byte|short"
+     ]
+    }
+   ],
+   "modelAnswer": "TCP/IP headers carry multi-byte integers in network byte order, which is big-endian (most significant byte first). x86 stores integers little-endian. For example, port 8080 = 0x1F90 sits in x86 memory as 90 1F, but must go on the wire as 1F 90. htons (host to network short) swaps the two bytes of a 16-bit value such as a port. htonl swaps the four bytes of a 32-bit value such as an IPv4 address. ntohs/ntohl convert back. On a big-endian host they do nothing, so code that uses them is portable.",
+   "explanation": "Key points: big-endian network order, little-endian host, the 16 vs 32-bit variants, and a correct worked example.",
+   "id": "L01-s2"
+  },
+  {
+   "q": "A server process keeps dying with no error message and the shell shows exit code 141. Explain what is happening and how you would fix it.",
+   "checks": [
+    {
+     "label": "Identifies SIGPIPE",
+     "patterns": [
+      "sigpipe"
+     ]
+    },
+    {
+     "label": "Explains 141 = 128 + 13",
+     "patterns": [
+      "128"
+     ]
+    },
+    {
+     "label": "Cause: writing to a peer/socket that has closed",
+     "patterns": [
+      "clos"
+     ]
+    },
+    {
+     "label": "Fix: ignore/handle the signal or use MSG_NOSIGNAL and check EPIPE",
+     "patterns": [
+      "ignore|sig_ign|msg_nosignal|epipe|handle"
+     ]
+    }
+   ],
+   "modelAnswer": "Exit code 141 = 128 + 13: the process was killed by signal 13, SIGPIPE. That happens when the server write()s to a socket whose peer has already closed (for example the user closed the browser tab). By default SIGPIPE terminates the process silently. Fix: ignore the signal (signal(SIGPIPE, SIG_IGN)) or send with MSG_NOSIGNAL, then check write()'s return value for -1/EPIPE, close that client socket and carry on serving others.",
+   "explanation": "The examiner looks for decoding 141 as 128+signal, naming SIGPIPE and its cause, and a practical fix.",
+   "id": "L01-s3"
+  },
+  {
+   "q": "You must migrate a domain whose A record has a 24-hour TTL to a new server IP. Describe the safe procedure and explain why it works.",
+   "checks": [
+    {
+     "label": "Lower the TTL first (e.g. to 5 minutes)",
+     "patterns": [
+      "lower|reduce|decrease"
+     ]
+    },
+    {
+     "label": "Wait at least the old TTL (24h) before switching",
+     "patterns": [
+      "wait"
+     ]
+    },
+    {
+     "label": "Explains resolvers/ISPs/browsers cache the record for the TTL",
+     "patterns": [
+      "cach"
+     ]
+    },
+    {
+     "label": "Keep the old server running during the transition",
+     "patterns": [
+      "old server|keep.*old|both"
+     ]
+    }
+   ],
+   "modelAnswer": "Resolvers, ISPs and browsers cache the record for its TTL, so a change can take up to 24 hours to reach everyone. Steps: (1) lower the TTL to about 5 minutes days before the move; (2) wait at least the old TTL (24h, ideally longer) so every cache now holds the short-TTL record; (3) change the A record to the new IP, after which caches expire within minutes; (4) keep the old server running (or forwarding) for a few days for stragglers, then raise the TTL again.",
+   "explanation": "It must show that TTL equals cache lifetime, and the order: lower first, wait, then change, with a safety overlap.",
+   "id": "L01-s4"
+  },
+  {
+   "q": "The iterative echo server can only serve one client at a time. Describe how fork() lets it serve many, including how the code tells parent and child apart.",
+   "checks": [
+    {
+     "label": "fork creates a copy of the process",
+     "patterns": [
+      "copy|duplicate|clone"
+     ]
+    },
+    {
+     "label": "Return value 0 means child",
+     "patterns": [
+      "0|zero"
+     ]
+    },
+    {
+     "label": "Parent gets the child's PID and goes back to accept",
+     "patterns": [
+      "pid"
+     ]
+    },
+    {
+     "label": "Child handles the client socket / parent closes it",
+     "patterns": [
+      "child"
+     ]
+    },
+    {
+     "label": "Mentions accept loop",
+     "patterns": [
+      "accept"
+     ]
+    }
+   ],
+   "modelAnswer": "After accept() returns a client socket, the server calls fork(), which creates a copy of the whole process (memory, variables and open file descriptors, including both sockets). fork returns 0 in the child and the child's PID in the parent. The child closes the listening socket, runs the read/write echo loop on the client socket, and exits. The parent closes its copy of the client socket and loops back to accept() for the next client, reaping finished children with waitpid(). Because each client has its own process, many clients are served at once. The cost is heavy per-connection processes, which is why pre-forked workers, threads or select/epoll are used at scale.",
+   "explanation": "Look for: copy semantics, the return-value convention, the division of work, and returning to accept.",
+   "id": "L01-s5"
+  },
+  {
+   "q": "Compare the three ways a protocol can frame messages on a TCP byte stream, with one real example of each.",
+   "checks": [
+    {
+     "label": "Fixed length",
+     "patterns": [
+      "fixed"
+     ]
+    },
+    {
+     "label": "Delimiter based",
+     "patterns": [
+      "delimit"
+     ]
+    },
+    {
+     "label": "Length-prefixed / TLV",
+     "patterns": [
+      "length.?prefix|tlv|type.?length"
+     ]
+    },
+    {
+     "label": "Example for fixed (SMS 140 / SS7 272)",
+     "patterns": [
+      "140|272|sms|ss7"
+     ]
+    },
+    {
+     "label": "Example for delimiter (CRLF / SMTP dot)",
+     "patterns": [
+      "crlf|\\\\r\\\\n|smtp|blank line|empty line"
+     ]
+    }
+   ],
+   "modelAnswer": "TCP is a byte stream with no message boundaries, so the protocol must mark them.\n1. Fixed length: every message is N bytes. Simple and fast to parse but wasteful or limiting. Examples: SMS user data of 140 bytes, SS7 MTP signal units of up to 272 bytes.\n2. Delimiter: a special sequence ends the message. Easy to read, but the delimiter must be escaped in the data. Examples: HTTP headers end with an empty line (CRLF CRLF); SMTP DATA ends with a line containing only '.'; MIME uses random boundaries.\n3. Length-prefixed / TLV (type, length, value): read the length, then exactly that many bytes. Efficient and binary-safe. Examples: ASN.1 BER, HTTP Content-Length for the body, protobuf fields.",
+   "explanation": "All three methods plus a correct example and some trade-off per method.",
+   "id": "L01-s6"
+  },
+  {
+   "q": "Why does Base64 increase size by about 33%? Compute the Base64 length of a 300-byte binary attachment (no line breaks).",
+   "checks": [
+    {
+     "label": "3 bytes become 4 characters",
+     "patterns": [
+      "3.{0,20}4|4/3"
+     ]
+    },
+    {
+     "label": "6 bits per character / 64 symbols",
+     "patterns": [
+      "6.?bit|64"
+     ]
+    },
+    {
+     "label": "Correct answer 400",
+     "patterns": [
+      "400"
+     ]
+    }
+   ],
+   "modelAnswer": "Base64 uses an alphabet of 64 = 2^6 symbols, so each output character carries only 6 bits. It takes 3 input bytes (24 bits) and emits 4 characters (4 × 6 = 24 bits), so the output is 4/3 the input, about 33% larger, and each character still costs a full byte on the wire. A 300-byte attachment is 300 / 3 = 100 groups × 4 = 400 characters (no padding needed because 300 divides by 3).",
+   "explanation": "Needs the 6-bit / 3-to-4 reasoning and the arithmetic 300 → 400.",
+   "id": "L01-s7"
+  }
+ ],
+ "subtitle": "",
+ "quiz": [
+  {
+   "quiz": 1,
+   "qn": 1,
+   "lecture": 1,
+   "title": "Client vs Server System Calls",
+   "q": "A TCP server is built from seven system calls. Which one is never made by an ordinary TCP client?",
+   "options": [
+    "socket()",
+    "accept()",
+    "write()",
+    "close()"
+   ],
+   "answer": 1,
+   "explanation": "accept() is purely a server call: it takes the next completed handshake off the listening socket's queue and returns a brand-new descriptor for that one client. A TCP server makes seven calls (socket, bind, listen, accept, read, write, close), but a client only needs socket(), connect(), read/write and close(), because it never waits for anyone to connect to it. The client never calls listen or accept, and bind is optional (the kernel picks an ephemeral port).",
+   "distractors": "socket(), write() and close() are made by both sides: every endpoint needs a socket, sends data and eventually closes its descriptor.",
+   "lectureRef": "The client side and ephemeral ports",
+   "id": "Q1-1",
+   "ref": "<a href=\"../lectures/lecture-01.html#n-the-client-side-and-ephemeral-ports\">Lecture 1: The client side and ephemeral ports</a>"
+  },
+  {
+   "quiz": 1,
+   "qn": 2,
+   "lecture": 1,
+   "title": "Byte Order and htons()",
+   "q": "addr.sin_port = htons(2026); and on the wire the port bytes read 07 EA. Why is htons() needed?",
+   "options": [
+    "To reserve the port with the kernel before bind()",
+    "To widen the port from 8 to 16 bits",
+    "Because x86 stores 0x07EA little-endian (EA 07) and network byte order is big-endian",
+    "Because ports above 1024 must be encoded as unsigned"
+   ],
+   "answer": 2,
+   "explanation": "Network byte order is big-endian (most significant byte first), while x86 stores integers little-endian. 2026 is 0x07EA, so in x86 memory it sits as EA 07; htons() swaps the two bytes so the header carries 07 EA, which every host on the network reads the same way. Without it the peer would read the port as 0xEA07 = 59911.",
+   "distractors": "htons() does not reserve anything with the kernel (bind does that), ports are already 16-bit, and signedness has nothing to do with port 1024; the only job of htons is reordering bytes.",
+   "lectureRef": "Addresses, INADDR_ANY and byte order (htons/htonl)",
+   "id": "Q1-2",
+   "ref": "<a href=\"../lectures/lecture-01.html#n-addresses-inaddr-any-and-byte-order-htons-htonl\">Lecture 1: Addresses, INADDR_ANY and byte order (htons/htonl)</a>"
+  },
+  {
+   "quiz": 1,
+   "qn": 3,
+   "lecture": 1,
+   "title": "Privileged Ports and Front Proxies",
+   "q": "Why do real deployments bind 8080 as an unprivileged user and let a front proxy own 80 and 443?",
+   "options": [
+    "Because 8080 is handled by a faster kernel path",
+    "Ports below 1024 require root, and a bug in an app's request parser running as root is a root compromise",
+    "Because HTTP/1.1 keep-alive only works above 1024",
+    "Because the kernel reserves 80 and 443 for TLS termination"
+   ],
+   "answer": 1,
+   "explanation": "On Linux/Unix only root can bind ports below 1024 (the lecture demo failed to bind port 50 as a normal user). If the application itself bound 80 it would have to run as root, so any bug in its request parsing would hand an attacker root. Instead the app runs unprivileged on a high port such as 8080, and a small, hardened front proxy (e.g. nginx, whose master binds 80/443 and whose workers do the I/O) owns the privileged ports and forwards traffic.",
+   "distractors": "There is no faster kernel path for 8080, keep-alive works on any port, and the kernel does not reserve 80/443 for TLS; the reason is purely the root requirement for ports below 1024.",
+   "lectureRef": "Ports: range, privileged ports and famous numbers",
+   "id": "Q1-3",
+   "ref": "<a href=\"../lectures/lecture-01.html#n-ports-range-privileged-ports-and-famous-numbers\">Lecture 1: Ports: range, privileged ports and famous numbers</a>"
+  },
+  {
+   "quiz": 1,
+   "qn": 4,
+   "lecture": 1,
+   "title": "TLV Forward Compatibility",
+   "q": "TLV (type-length-value) is called forward compatible. What property gives it that?",
+   "options": [
+    "Types are sorted, so a parser can binary-search for the field it wants",
+    "Every value is a fixed size, so field offsets never move",
+    "Values are base64-encoded, so unknown bytes always survive",
+    "The length tells a parser how far to jump, so it can skip a field type it has never seen"
+   ],
+   "answer": 3,
+   "explanation": "In TLV every field announces its type and its length before the value. A receiver that meets a type it does not know can still read the length and jump that many bytes to the next field, so a new version can add field types without breaking old parsers. That ability to skip the unknown is what makes TLV forward compatible (ASN.1 BER and FastCGI records use the same idea).",
+   "distractors": "TLV values are variable-length, not fixed-size; types need not be sorted; and nothing about TLV involves Base64.",
+   "lectureRef": "Designing a protocol: framing, text vs binary, Base64, ASN.1/protobuf, RPC",
+   "id": "Q1-4",
+   "ref": "<a href=\"../lectures/lecture-01.html#n-designing-a-protocol-framing-text-vs-binary-base64-asn-1-protobuf-rpc\">Lecture 1: Designing a protocol: framing, text vs binary, Base64, ASN.1/protobuf, RPC</a>"
+  },
+  {
+   "quiz": 1,
+   "qn": 5,
+   "lecture": 1,
+   "title": "Base64 Overhead",
+   "q": "Base64 exists so binary can travel through text-only channels. What does it cost?",
+   "options": [
+    "About 33% more bytes: 3 input bytes become 4 output characters",
+    "Exactly 2x the bytes: each byte becomes two characters",
+    "Nothing — it is the same size, just re-encoded",
+    "About 12% more bytes, plus a 4-byte header per message"
+   ],
+   "answer": 0,
+   "explanation": "Base64 maps every 3 bytes (24 bits) onto 4 characters of 6 bits each, drawn from 64 safe characters (A-Z, a-z, 0-9, +, /, with = as padding). Four output bytes for every three input bytes is 4/3 the size, roughly 33% bigger. That is the price of making arbitrary binary safe for text-only channels such as email or JWTs.",
+   "distractors": "Exactly 2x is the cost of hex encoding (two characters per byte), not Base64; it is never free; and there is no 12% figure or per-message header.",
+   "lectureRef": "Designing a protocol: framing, text vs binary, Base64, ASN.1/protobuf, RPC",
+   "id": "Q1-5",
+   "ref": "<a href=\"../lectures/lecture-01.html#n-designing-a-protocol-framing-text-vs-binary-base64-asn-1-protobuf-rpc\">Lecture 1: Designing a protocol: framing, text vs binary, Base64, ASN.1/protobuf, RPC</a>"
+  },
+  {
+   "quiz": 1,
+   "qn": 23,
+   "lecture": 1,
+   "title": "Meaning of AF_INET",
+   "q": "What does AF_INET represent in a socket call?",
+   "options": [
+    "IP socket",
+    "TCP socket",
+    "UDP socket",
+    "Unix socket"
+   ],
+   "answer": 0,
+   "explanation": "AF_INET is the address family for IPv4, so socket(AF_INET, ...) creates an IP (version 4) socket. Whether it is TCP or UDP is chosen by the second argument: SOCK_STREAM for TCP, SOCK_DGRAM for UDP.",
+   "distractors": "TCP and UDP come from the socket type, not the family, and Unix-domain sockets use AF_UNIX.",
+   "lectureRef": "The server lifecycle: socket, bind, listen, accept, read/write, close",
+   "id": "Q1-23",
+   "ref": "<a href=\"../lectures/lecture-01.html#n-the-server-lifecycle-socket-bind-listen-accept-read-write-close\">Lecture 1: The server lifecycle: socket, bind, listen, accept, read/write, close</a>"
+  },
+  {
+   "quiz": 2,
+   "qn": 3,
+   "lecture": 1,
+   "title": "Skipping Unknown TLV Fields",
+   "q": "TLV (type-length-value) framing is called forward compatible. What property gives it that?",
+   "options": [
+    "It compresses the value field automatically",
+    "It is always shorter than fixed-width framing",
+    "A receiver that doesn't recognize a type can skip it using the length field",
+    "It requires a delimiter byte that never appears in the payload"
+   ],
+   "answer": 2,
+   "explanation": "In TLV every field carries its own type and length. A receiver that does not recognize a type can read the length and skip exactly that many bytes, so newer senders can add fields without breaking older receivers. That is forward compatibility.",
+   "distractors": "TLV does no compression, it is often longer than fixed-width framing because of the type and length bytes, and it needs no delimiter: the length is used instead.",
+   "lectureRef": "Designing a protocol: framing, text vs binary, Base64, ASN.1/protobuf, RPC",
+   "id": "Q2-3",
+   "ref": "<a href=\"../lectures/lecture-01.html#n-designing-a-protocol-framing-text-vs-binary-base64-asn-1-protobuf-rpc\">Lecture 1: Designing a protocol: framing, text vs binary, Base64, ASN.1/protobuf, RPC</a>"
+  },
+  {
+   "quiz": 2,
+   "qn": 4,
+   "lecture": 1,
+   "title": "Cost of Base64 Safety",
+   "q": "Base64 lets binary data travel safely through text-only channels. What does that safety cost?",
+   "options": [
+    "About 33% size overhead (4 output characters per 3 input bytes)",
+    "A mandatory extra round trip to negotiate encoding",
+    "Loss of one bit of precision per byte",
+    "Roughly 200% size overhead"
+   ],
+   "answer": 0,
+   "explanation": "Base64 turns every 3 input bytes into 4 output characters (6 bits each), so the output is 4/3 the size, about 33% larger. That is the cost of carrying binary through text-only channels such as email attachments, JWTs and CI variables.",
+   "distractors": "Base64 needs no negotiation round trip, it is lossless (it decodes back exactly), and 200% overhead is far off (even hex is only 100%).",
+   "lectureRef": "Designing a protocol: framing, text vs binary, Base64, ASN.1/protobuf, RPC",
+   "id": "Q2-4",
+   "ref": "<a href=\"../lectures/lecture-01.html#n-designing-a-protocol-framing-text-vs-binary-base64-asn-1-protobuf-rpc\">Lecture 1: Designing a protocol: framing, text vs binary, Base64, ASN.1/protobuf, RPC</a>"
+  }
+ ],
+ "prev": null,
+ "next": {
+  "num": 2,
+  "file": "lecture-02.html"
+ }
+};
