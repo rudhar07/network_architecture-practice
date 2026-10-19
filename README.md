@@ -1,4 +1,4 @@
-# Network Architecture: End-term Revision
+# Network Architecture: Revision
 
 An interactive revision site for **Network Architecture**: 8 lectures, each with one-shot notes, key terms, the matching
 class quiz questions, practice MCQs and written questions. **259 questions** in total.
