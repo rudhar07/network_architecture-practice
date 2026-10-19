@@ -213,10 +213,10 @@ th { background: var(--surface-2); }
 .feedback:not(.ok):not(.bad) { background: var(--surface-2); border-color: var(--border); }
 @media (max-width: 520px) { .section-nav { top: 0; position: static; } .note-sec { padding: 2px 12px 12px; } }
 
-/* ---------- Colour scheme (both light and dark mode): purple page #5D3FD3, periwinkle buttons #CCCCFF ----------
+/* ---------- Colour scheme (both light and dark mode): purple page #340055, periwinkle buttons #CCCCFF ----------
    Light mode keeps white content cards; dark mode keeps dark content cards. */
 :root {
-  --page-bg: #5D3FD3; --btn-bg: #CCCCFF; --btn-bg-hover: #B8B8F5; --btn-text: #1E1452;
+  --page-bg: #340055; --btn-bg: #CCCCFF; --btn-bg-hover: #B8B8F5; --btn-text: #1E1452;
   --on-page: #FFFFFF; --on-page-muted: rgba(255, 255, 255, .88);
   --accent: #5D3FD3; --accent-soft: #ECE8FB;
 }
