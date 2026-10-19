@@ -1,0 +1,743 @@
+{
+  "num": 6,
+  "title": "(Ab)using CDNs",
+  "summary": "Why CDNs exist (the speed of light and round trips), and how edges, tiered caches, warm connection pools and anycast cut time-to-first-byte below the physical RTT to the origin. It covers cache keys, cache statuses, caching personalised pages (SSI, ESI, AJAX, Railgun), consistent hashing and request collapsing, and then 'abusing' the CDN as WAF, rate limiter, DDoS shield, API gateway and edge-compute platform, along with the risks that brings.",
+  "notes": [
+    {
+      "heading": "What a CDN is, and seeing one with curl",
+      "body": "The instructor described a **CDN** as **someone else's reverse proxies, deployed close to your users**. You only ever talk to the CDN **edge** (the outer boundary, also called a **PoP**, point of presence). Behind it, the edge can talk to other edges, to cache tiers and to the origin, possibly in several tiers. Nginx and **Varnish** (a \"reverse caching proxy\") started as exactly this kind of building block, and some CDNs literally run fleets of them.\n\nThis lecture adds no fundamentally new concepts. It **reapplies earlier ones** (reverse proxies, keep-alive, connection pools, ETags, caching, Vary, BBR, multiplexing) to a network that sits between users and the **origin** server.\n\n### Seeing a CDN from the terminal\n```\ncurl -sI https://example-site.com          # -I: headers only, -s: silent\ncurl -s https://example-site.com/cdn-cgi/trace   # Cloudflare debug endpoint\n```\n- Cloudflare's `/cdn-cgi/trace` shows `colo=BOM` (the PoP, named after the nearest **IATA airport code**: BOM = Mumbai, MAA = Chennai, SIN = Singapore), `http=http/2`, `tls=TLSv1.3`, `sni=plaintext`, `uag=` (a short name for user agent), `visit_scheme`, `loc`, and so on. Bangalore traffic was often served from Chennai (MAA), because many CDNs have no large colo in Bangalore.\n- Response headers reveal the CDN: `server: cloudflare` + `cf-cache-status` + `cf-ray: <id>-BOM`. Akamai uses `server: AkamaiGHost`, CloudFront adds `x-amz-cf-pop`, and Google's front end shows `server: gws`/`gfe`.\n- Even field names can be shortened to save bytes, like `uag` for user agent. This is the same idea as the binary-HTTP project."
+    },
+    {
+      "heading": "Physics: the speed of light sets the latency floor",
+      "body": "- Speed of light in vacuum ≈ **3 × 10^5 km/s**. Glass has refractive index ≈ 1.5, and optical fibre ≈ **1.46–1.47**. A refractive index **can't be below 1** relative to vacuum, so 0.98 was the obviously wrong quiz option.\n- So light in fibre travels at about c/1.47 ≈ **204,000 km/s**, which is roughly **4.9 ms one way per 1,000 km**. Two computers 1,000 km apart can't talk faster than that. At 500 km, it's about 2.5 ms.\n- **Mumbai–Chennai** (~1,000 km): the theoretical RTT is ~10 ms, but the **measured RTT is ~20–23 ms**, because fibre doesn't run in a straight line and there are hops, queueing, loss and retransmission.\n- **Mumbai → AWS us-east-1** (N. Virginia, ~13,000 km): the physical minimum is ~64 ms one way, or **~126 ms RTT**, before any handshake. us-east-1 is AWS's oldest and largest region and has had the most outages.\n- **Hollow-core fibre**, where light travels through air or vacuum inside the core, cuts propagation delay. It's being tried over long distances and inside data centres.\n\n**Time to first byte (TTFB)** is the headline network metric, and it's dominated by **how many round trips** happen before data flows:\n- TCP handshake = 1.5 legs (SYN, SYN-ACK, ACK), so about 1 RTT before the client can send.\n- TCP + TLS 1.3, new connection: the first response byte arrives after **3 RTT** (TCP 1 + TLS 1 + request 1).\n- QUIC (UDP + TLS 1.3 combined): 1 RTT handshake, or 0-RTT on resumption.\n\n**The only ways to beat physics are fewer round trips, or moving the server closer to the user.** CDNs do both."
+    },
+    {
+      "heading": "Distance, packet loss and throughput",
+      "body": "Longer paths have more hops, more hardware and more fibre that can bend or degrade, so **packet loss probability rises with distance**. TCP's classic congestion control treats loss as congestion and slows down.\n\n**Beyond the lecture (formula):** the Mathis approximation for TCP throughput is\n```\nthroughput ≤ (MSS / RTT) × (C / √p)      C ≈ 1.22, p = loss rate\n```\nIt assumes full-size segments (MSS = maximum segment size). **Throughput is inversely proportional to RTT**: double the RTT and you halve the throughput. It also falls with the square root of the loss rate.\n\nThe lecture showed an old measurement table. Its first row: distance under 100 miles, **1.6 ms** RTT, ~0.6% loss, **44 Mbps** throughput, enough to download a 4 GB DVD in minutes. **Beyond the lecture:** the classic table (Akamai/Leighton) continues: regional ~16 ms RTT gives ~4 Mbps, cross-continent ~48 ms gives ~1 Mbps, and multi-continent ~96 ms gives ~0.4 Mbps, which takes days for the same DVD. The point is that **the same file over the same kind of network is about 100× slower across continents.**\n\nThis is also why HTTP/1.1 pipelining suffers on lossy long paths (everything queues behind a loss), and why HTTP/2 multiplexing and QUIC help."
+    },
+    {
+      "heading": "Why adding a middlebox can lower TTFB: the timing table",
+      "body": "Quiz: if you put a proxy between browser and origin, should TTFB go up or down? **Technically up**, because there's an extra hop and processing. But CDNs make it go down. Here is the class scenario, with the edge ~10 ms RTT from the user and the origin ~200 ms RTT away, for dynamic (uncached) content over TCP + TLS 1.3:\n\n| Path | Approx. TTFB | Why |\n|---|---|---|\n| Browser → origin, new connection | ~620 ms | 3 full long RTTs |\n| Browser → plain proxy → origin, nothing reused | ~621–625 ms | same RTTs plus proxy overhead: **worse** |\n| Browser → origin, connection kept alive | ~208 ms | handshakes already done, 1 RTT |\n| Browser ↔ edge ↔ origin, both kept alive | ~209 ms | almost direct, plus small edge cost |\n| New client→edge connection, **warm edge→origin pool** (cache miss) | ~230 ms | 3 short RTTs (~30 ms) + 1 long RTT |\n| New client→edge connection, **cache hit** | ~33 ms | 3 short RTTs, and the origin never sees the request |\n| Client keeps edge connection alive, **cache hit** | ~11 ms | 1 short RTT |\n\nRead the table as a whole:\n- **Keep connections alive.** It pays to skip the three handshake round trips. Browsers may not hold connections long, but **inside its own network the CDN controls behaviour**, so it keeps a **warm pool** to the origin.\n- **A cache hit beats physics.** An 11 ms TTFB for a site hosted ~126 ms away is \"impossible\" without an edge close to the user.\n- **Cache hit ratio is a huge deal.** 99.9% versus 90% is a big difference in user experience.\n\nQuiz: **which is worst for a far-away user: proxy, reverse proxy or CDN?** The **reverse proxy**, because it sits next to the origin and far from the user, so it adds a hop without shortening the path. A forward proxy is closer to the user, so it's better, but someone (the user, a company or a college) has to run it. A CDN is a reverse proxy that a company pays to place near *all* users."
+    },
+    {
+      "heading": "Tiered caching, origin shield and connection pools",
+      "body": "### Tiered cache: the showroom and warehouse analogy\n- **Edges** (hundreds of PoPs) are like **showrooms on the main street**: close to customers, expensive real estate, small, and stocked with the fast-moving goods.\n- **Tier (mid-tier, regional or parent) caches** are like **warehouses outside the city**: still reasonably close, but cheaper, so they get bigger machines, more RAM and much larger caches.\n- Edges go to a tier first instead of hitting the origin directly. Many edges share one tier. For example, PoPs in Electronic City and Richmond Road may see different content (more Tamil films in one, more Marathi in Mumbai), but the shared tier holds both, evicts less, and its larger LRU cache keeps more.\n- The tier closest to the origin acts as an **origin shield**: the origin sees requests from a few shield nodes instead of hundreds of edges.\n\n### Who controls which link\n```\nBrowser --(internet, little control)--> Edge PoP ==(CDN-owned network)==> Tier cache --(cloud/ISP link)--> Origin\n```\nBetween edge and tier, the CDN owns everything, so it can use **custom TCP tuning, BBR, persistent multiplexed connections**, and even non-standard protocols. Between tier and origin, it depends on the cloud or hosting provider, unless there's a private link.\n\n### Connection pools: the library analogy\nA pool holds, say, 10 open connections. A worker **borrows** one, uses it, and **returns** it, like borrowing a library book. 100 readers don't need 100 books. If an 11th reader arrives, they **wait**, which is the latency cost. Pools have a **min** (kept warm) and a **max** (upper limit), and every decent database driver exposes both. **Configure them.**\n- With a shared pool, even 300 requests may need only a handful of connections. New connections are created only when requests are waiting.\n- Pools also sit between load balancers and app servers.\n- With HTTP/1.1 a pooled connection carries one request at a time (pipelining has HOL blocking). **HTTP/2 multiplexing** lets one connection carry many concurrent requests, which is ideal for edge↔tier links. CDN↔origin and browser↔edge can't assume HTTP/2 or 3 support.\n- Fewer connections and fewer origin fetches mean **less money spent**.\n- Between edge and tier, all sites share the same IPs and are told apart by the **Host header**, so connections never need to close. CDNs even keep idle connections warm on purpose."
+    },
+    {
+      "heading": "Routing users to the nearest edge: DNS steering and anycast",
+      "body": "- **DNS-based (GeoDNS) steering:** the CDN's DNS returns different IPs depending on where the resolver appears to be. It sometimes gets this wrong and sends you to a far edge.\n- **Anycast:** the **same IP** is announced from many PoPs via **BGP** (Border Gateway Protocol, where networks announce \"I own this IP range, route it to me\"). Internet routing naturally delivers your packets to the topologically nearest PoP. One IP maps to many machines in different places.\n- **Contrast with IP aliasing** (from an earlier lecture): one machine with many IPs. Anycast is the reverse: one IP, many machines.\n- **Cloudflare uses anycast.** Not every CDN does. The `colo` and `cf-ray` suffix show where you landed, and in one demo traffic landed in Singapore (SIN) unexpectedly.\n- A forward caching proxy such as **Squid** does proxy caching, not reverse-proxy caching. A CDN is reverse caching plus massive geographic distribution.\n- If your nearest edge isn't actually near you, you lose most of the benefit. A lot of patented innovation (routing, IP acceleration, BBR) happens here."
+    },
+    {
+      "heading": "The major CDNs",
+      "body": "| CDN | Notes from the lecture |\n|---|---|\n| **Akamai** | One of the earliest CDNs (late 1990s). Edge server identifies as `AkamaiGHost`. Now has edge functions. |\n| **AWS CloudFront** | AWS's CDN. Uses BBR internally. Has Lambda@Edge / functions. |\n| **Fastly** | Started on **Varnish**. Big in the US. |\n| **Google (Cloud CDN / Media CDN)** | Sold as \"what YouTube uses\". Google created QUIC and BBR, so with Chrome it can be QUIC end to end plus BBR inside the network. |\n| **Broadpeak** | Lets **telcos** deploy their own CDN inside their network (relevant to video streaming). |\n| **Cloudflare** | Easiest self-serve: good dashboard, API and MCP, developer-friendly, generous free tier. Started on **nginx**, now on its own Rust proxy **Pingora**. |\n\n- Nginx (through OpenResty) exposes **Lua** to modify requests or even answer them without touching an upstream, and HAProxy offers similar scripting. That's where \"logic at the edge\" started.\n- Big sites and JS libraries are served from CDNs (cdnjs, jsDelivr, unpkg), such as Bootstrap and Font Awesome. You can spot the CDN from the `server` header or browser extensions."
+    },
+    {
+      "heading": "What gets cached, the cache key, and cache statuses",
+      "body": "### Defaults\nMost CDNs cache **static file extensions** by default: CSS, JS and images (the instructor quoted **68 extensions** for Cloudflare). They **don't cache HTML or JSON**, which are treated as dynamic unless you configure them. **Caching is decided by extension, not MIME type.**\n\n**Trap:** you upload a new logo with the same name and it doesn't show up, because the edge still serves the cached PNG. The fix is to **change the URL** (versioned or fingerprinted filenames like `logo.v2.png` or `logo.3fa9c1.png`), because **the URL is the cache key**, or to send a **purge** command. The origin can steer caching with `Cache-Control` (max-age, s-maxage, no-store), `Expires`, `Set-Cookie` (which usually means don't cache), and CDN rules setting the **edge TTL** and **browser TTL** separately.\n\n### The cache key\n```\ncache key = scheme + host (+ port) + path + query string   ... + Vary'd request headers\n```\nThe slide version without Vary is a \"lie\": **Vary** headers also join the key. Cookies and most other headers are *not* in the key by default.\n- **Query strings are dangerous.** `?q=1` gives a MISS, `?q=1` again gives a HIT, and `?q=2` gives a MISS. Ad clicks append `gclid=...` (Google) or `fbclid=...` (Facebook), which makes every visitor a cache miss.\n- **Best practice:** key on scheme + host + path, **whitelist** only the query parameters that change the content, and **sort** parameters (`a=1&b=2` and `b=2&a=1` are different strings).\n- Some CDNs key on the outward-facing hostname, others on the origin hostname. This matters for domain sharding and multi-domain setups.\n\n### Cloudflare `cf-cache-status` values\n| Status | Meaning |\n|---|---|\n| HIT | Served from edge cache. The origin isn't contacted. |\n| MISS | Not in cache, so fetched from the origin. |\n| EXPIRED | Was cached but its TTL passed, so refetched from the origin. |\n| REVALIDATED | Stale copy confirmed with a conditional request (If-None-Match / If-Modified-Since → **304**). The origin is hit but few bytes move. |\n| UPDATING | Stale copy served while it's refreshed in the background. |\n| STALE | Origin unreachable or erroring, so a stale copy is served. |\n| DYNAMIC | Not eligible for caching by default (e.g. HTML/JSON). |\n| BYPASS | Eligible, but the origin said not to cache (no-cache, no-store, Set-Cookie...). |\n\n**Serving stale on error** (\"always online\" in Cloudflare's early branding, `stale-if-error`, nginx `proxy_cache_use_stale`) keeps a small site's pages up even when the origin is dead. The instructor said he plans to ask at least one exam question on Expires, Cache-Control or If-Match."
+    },
+    {
+      "heading": "Caching personalised pages: SSI, ESI, AJAX, Railgun",
+      "body": "HTML is \"uncacheable\" because a small part, such as \"Hi, <name>\" or the cart, differs per user. The evolution of **\"cache the static shell, fill the holes\"**:\n\n1. **SSI (Server Side Includes, ~1990s, on the origin web server).** HTML comments with instructions such as `<!--#include virtual=\"/user.html\" -->` or `<!--#exec cmd=\"...\" -->`. The server **forked** programs to fill them, which looks like a bad idea in hindsight (fork per include). Servers still ship SSI, and includes can now come from an upstream.\n2. **ESI (Edge Side Includes, early CDN tech from Akamai and others).** The same idea moved to the **edge**: the cached page contains **holes**, and the edge fetches only the personalised fragments from the origin and stitches them in.\n   ```\n   <esi:include src=\"/fragment/user\" />\n   <esi:include src=\"/fragment/cart\" />\n   ```\n3. **AJAX (~2005; XMLHttpRequest, now `fetch`).** The **browser** becomes the stitcher. The whole static page or SPA is cached on the CDN, and JavaScript fetches the dynamic parts.\n4. **Railgun (Cloudflare, now discontinued).** A daemon with **memcached** sat next to your origin, paired with the edge. Both kept the **last version** of each page and sent only the **delta** (a few changed bytes plus a reference ID) over the long link. The same idea later appeared as an RFC on delta encoding. The instructor's teams used diff-sync for cricket scorecards, where only a few bytes change.\n\n| Technique | Where pages are assembled |\n|---|---|\n| SSI | Origin server |\n| ESI | CDN edge |\n| AJAX/fetch | Browser |\n| Railgun | Origin-side daemon ↔ edge, sending only diffs |\n\n### The ESI trade-off: more requests, fewer bytes\nLoad a page with 2 personalised fragments **100 times**:\n- Origin renders the full page every time: **100 requests**, each carrying the whole page.\n- With ESI: **1** request for the cacheable template + **100 × 2** fragment requests = **201 origin requests**, but each fragment is tiny, so **total bytes drop sharply**.\n\nThe instructor said the SSR/SSG trend (Next.js/Vercel, Node rendering whole pages) sends fully assembled pages. He called that an HTTP/1-era instinct to minimise request counts, when with HTTP/2 it's often better to let edges or browsers assemble pages. Sometimes you do prefer fewer requests over fewer bytes. It's a trade-off.\n\n**Compression aside:** gzip's default level is 6, and `-9` is the slowest and best. **zstd** is increasingly preferred because it's both faster and compresses better. Brotli is common for web content."
+    },
+    {
+      "heading": "Consistent hashing in multi-box caches",
+      "body": "To decide which cache server holds a key, simple `hash(key) mod N` is a disaster when N changes: add or lose one server and almost **every** key maps somewhere new, so the whole cache effectively empties at once.\n\n**Consistent hashing** puts servers and keys on a hash ring. Each key goes to the next server clockwise. Adding or removing a server moves only about **1/N of the keys**. Each physical server is placed at many points on the ring (**virtual nodes**, e.g. **160 points per server** as in ketama-style implementations) so the load spreads evenly.\n\nThe instructor said nobody uses plain modulo hashing in real multi-box caches. CDN mid-tiers and any distributed cache use consistent hashing."
+    },
+    {
+      "heading": "Thundering herd and request collapsing",
+      "body": "**Thundering herd:** a popular object expires (or is new), and thousands of users ask for it at once. Every edge misses and forwards the request, and the origin gets flattened.\n\nFixes:\n- **Tiered caching** funnels hundreds of edges through a few tiers, so the origin sees a handful of requests instead of hundreds.\n- **Request collapsing** (also called request coalescing or cache lock): the first request for a cache key **takes a lock** and goes upstream, and every other request for the same key **waits** and is served from that single response. If the first fetch is slow everyone waits, and that's fine because sending 100 identical requests wouldn't help.\n- In **nginx** this is **`proxy_cache_lock on;`** (lecture 4). Shared storage extends it across many boxes in a distributed system. Different CDNs use different names for it.\n- The instructor noted that places without collapsing behave very badly, especially for **live video**, which comes up in a later lecture."
+    },
+    {
+      "heading": "\"Abusing\" the CDN: security at the edge",
+      "body": "Since **every request already passes through the CDN**, why not make it do more?\n\n- **WAF (Web Application Firewall):** pattern rules block **SQL injection** (`' OR 1=1 --`, `'; DROP TABLE students; --`, the \"**Bobby Tables**\" xkcd), **XSS**, scanners and, newer, **prompt-injection** inspection. **Virtual patching:** when **Log4j (Log4Shell)** hit, sites behind CDNs were protected as soon as the CDN pushed a WAF rule, even before the vulnerable code was fixed.\n- **Rate limiting** on login, OTP, registration and order creation (\"how can one user order 1,000 times a second?\"), and against crawlers. Doing it at the edge means every service doesn't have to reimplement it. An API gateway is the alternative.\n- **DDoS absorption:** the lecture cited a Cloudflare-mitigated attack of about **31 Tbps lasting ~35 seconds**, blocked automatically. A single origin would simply die, or you'd pay a huge cloud bill. The instructor first learned CDNs existed in 1999, when a site got DDoSed.\n- **Origin lockdown (shield):** firewall the origin so it **only accepts traffic from the CDN's IP ranges**. Then attackers can't bypass the WAF by hitting the origin directly. All the edge security above depends on this.\n- **Strip banner headers** such as `X-Powered-By` and `Server` version strings. This defeats **banner grabbing**, where attackers look up known CVEs for the software and version you advertise.\n- **TLS termination** at the edge, close to the user.\n\n### Rate-limiting algorithms\n- **Fixed (tumbling) window:** count per fixed minute. It's the weakest: with a limit of 100/min, a client can send 99 at 0:59 and 99 at 1:00, which is **198 in about 2 seconds** without breaking either window's limit.\n- **Sliding window:** counts the last 60 s at any instant. This is what most people want.\n- **Token bucket / leaky bucket:** smooth out bursts and enforce an average rate. You choose between burst and average, and whether to alert (\"log\") or block."
+    },
+    {
+      "heading": "The CDN as API gateway and edge compute",
+      "body": "More things the edge can do:\n- **Authentication:** reject requests without a cookie or JWT, or with an expired JWT, **before** they reach the origin. The origin then doesn't need that code.\n- **Header manipulation:** add headers (country, state or **ASN** of the client, which identifies its network/ISP), strip dangerous headers, add caching headers, apply CORS allow-lists.\n- **Routing and failover:** try origin 1 and fall back to origin 2. Stop sending to an origin whose **5xx rate exceeds 10%** or whose **latency exceeds 500 ms**. Route by geography.\n- **Edge compute:** **Cloudflare Workers** (JavaScript `async fetch(request)` handlers), AWS Lambda@Edge and CloudFront Functions, Akamai EdgeWorkers. Even dynamic code can run at the edge or mid-tier, with storage in the mid-tier, giving latency the origin can't match. Workers can verify JWTs or set headers.\n\n### Cloudflare dashboard demo (free plan)\n- DNS records are either **Proxied** (orange cloud: traffic goes through Cloudflare, and curl shows `server: cloudflare`) or **DNS only** (grey cloud: resolves straight to the origin, for example a Google-hosted subdomain). The same domain can have both. The instructor runs about 20 subdomains free.\n- **Cache Rules** match on URL, path, query string, cookie, referer, user agent, X-Forwarded-For or extension (e.g. \"if extension is html, cache it\"), and set **edge TTL** and **browser TTL** independently.\n- Security rules (SQLi, rate limits, which the free tier also has), **Transform rules** (remove `X-Powered-By`), **Workers**, and **Cloudflare Tunnel** (`cloudflared`, similar to ngrok).\n- CDN DSLs are all similar. The instructor runs yearly **CDN audits**, comparing rules across the CDNs he uses so that switching one for another won't break anything."
+    },
+    {
+      "heading": "The costs and risks of using a CDN",
+      "body": "- **The CDN holds your TLS private keys.** You authorise it to impersonate your site every day.\n- **Single point of failure:** when Cloudflare, Akamai or another big CDN has a bad deployment, a large share of the internet goes down with it (\"Cloudflare down, ~30% of sites down\"). The instructor still recommends using one, and **multi-CDN** setups reduce the risk.\n- **Takedown power:** a pirate on Fastly, Akamai or AWS can be reported and blocked, but that also gives the CDN the power to block *you*. If your **DNS is hosted at the same CDN**, a block lasts longer, because you have to change nameservers at the registry.\n- **Vendor lock-in:** once you rely on its WAF rules, Workers and gateway features, moving is hard. Another CDN may have 50 features, but if 2 of yours are missing you can't switch.\n- **Cache poisoning:** a misconfigured cache key (unkeyed headers, query or host handling) can store one user's or attacker's response and **serve it to everyone**, including injected XSS. Keep keys tight (scheme + host + path + whitelisted query).\n- **Cache deception:** because caching goes by **extension, not MIME type**, a `.css` URL that actually returns JavaScript or private data will still be cached by edges.\n- **Encryption of public content:** the transport stack (QUIC/TLS) encrypts even public assets. That's a small cost, accepted.\n\n### Try it yourself\nUse curl to watch `cf-cache-status` change between MISS and HIT. Measure TTFB with `curl -o /dev/null -s -w '%{time_starttransfer}\\n' URL`. Replace an unversioned image and see how long the old one keeps being served, then purge. Use the instructor's mock site (Mockingbird) to inject delays and errors."
+    },
+    {
+      "heading": "Quick revision",
+      "body": "- CDN = reverse proxies near users. You only ever talk to the edge (PoP).\n- Light in fibre ≈ 2/3 c ≈ 204,000 km/s ≈ 4.9 ms one way per 1,000 km.\n- Fibre refractive index ≈ 1.46–1.47. It can't be < 1.\n- Mumbai–Chennai: ~10 ms RTT theoretical, ~20–23 ms measured. Mumbai → us-east-1: ~126 ms minimum RTT.\n- TCP + TLS 1.3 new connection: first byte after 3 RTT. QUIC: 1-RTT handshake, 0-RTT on resume.\n- Throughput ≈ MSS/(RTT·√p), so longer distance means less throughput.\n- A plain proxy adds latency. A CDN reduces it via keep-alive, warm origin pools, edge cache hits and closeness.\n- Cache hit with keep-alive ≈ 11 ms versus ~620 ms cold direct. Cache hit ratio matters enormously.\n- Worst placement for a distant user: a reverse proxy next to the origin.\n- Tiered cache: edge (showroom) → tier/shield (warehouse) → origin. Fewer origin hits, bigger caches.\n- Connection pool = library: borrow, use, return. Configure min/max.\n- Anycast: one IP announced via BGP from many PoPs, routed to the nearest. Cloudflare uses it.\n- Cloudflare colo = airport code (BOM, MAA, SIN), shown in `cf-ray` and `/cdn-cgi/trace`.\n- Default caching is by extension (static files). HTML and JSON are dynamic.\n- Cache key = scheme + host + path + query (+ Vary). Whitelist and sort query params.\n- Changed asset not showing: version the URL or purge.\n- cf-cache-status: HIT, MISS, EXPIRED, REVALIDATED (304), UPDATING, STALE, DYNAMIC, BYPASS.\n- SSI (origin) → ESI (edge) → AJAX (browser) → Railgun (diffs). ESI means more requests but fewer bytes (100 views → 201 requests).\n- Consistent hashing: adding a node moves ~1/N keys. Virtual nodes (~160 per server).\n- Thundering herd → request collapsing / cache lock (`proxy_cache_lock`) + tiered cache.\n- Edge security: WAF, virtual patching (Log4j), rate limiting, DDoS absorption, origin lockdown, banner stripping.\n- Risks: CDN holds your TLS keys, single point of failure, takedown power, lock-in, cache poisoning."
+    },
+    {
+      "heading": "Exam traps",
+      "body": "- **\"Adding a hop always increases latency.\"** Only without caching or connection reuse. With edge caching and keep-alive, TTFB drops sharply.\n- **A reverse proxy is not a CDN.** A single reverse proxy next to the origin doesn't shorten the user's path. A CDN is reverse proxies distributed near users.\n- **Anycast ≠ GeoDNS.** Anycast uses the same IP everywhere and lets BGP route. GeoDNS returns different IPs per location.\n- **REVALIDATED still hits the origin.** It's a cheap 304 exchange, not zero-origin like HIT. EXPIRED fetches the full object.\n- **BYPASS vs DYNAMIC:** DYNAMIC means not cacheable by default (e.g. HTML). BYPASS means cacheable but the origin or a rule said not to cache.\n- **The URL alone is not the whole cache key.** Vary'd headers (and the query string, unless configured otherwise) are part of it.\n- **`?a=1&b=2` and `?b=2&a=1` are different keys** unless the CDN sorts query params.\n- **ESI reduces bytes, not requests.** Origin request count actually goes *up* (201 versus 100 in the example).\n- **The fixed-window limit can be doubled at the window boundary.** Sliding window fixes this.\n- **WAF is useless without origin lockdown.** Attackers will just hit the origin IP directly.\n- **CDN caching goes by extension, not MIME type.** This enables cache deception.\n- **Refractive index < 1 is impossible** for light in glass relative to vacuum.\n- **4.9 ms per 1,000 km is one way.** Double it for RTT."
+    }
+  ],
+  "keyTerms": [
+    {
+      "term": "CDN",
+      "def": "Content Delivery Network: a distributed set of reverse caching proxies placed near users, run by a third party."
+    },
+    {
+      "term": "Edge / PoP",
+      "def": "Point of presence: the CDN server location a client actually connects to, close to the user."
+    },
+    {
+      "term": "Origin",
+      "def": "Your own server that holds the authoritative content behind the CDN."
+    },
+    {
+      "term": "Colo",
+      "def": "Colocation facility; Cloudflare names its PoPs by IATA airport code (BOM, MAA, SIN)."
+    },
+    {
+      "term": "TTFB",
+      "def": "Time To First Byte: time from starting a request until the first response byte arrives."
+    },
+    {
+      "term": "Refractive index",
+      "def": "Ratio c/v; ~1.47 for fibre, so light in fibre travels ~204,000 km/s (~4.9 ms per 1,000 km)."
+    },
+    {
+      "term": "Tiered cache",
+      "def": "Edge caches fetch from larger mid-tier/regional caches instead of the origin, raising hit ratio."
+    },
+    {
+      "term": "Origin shield",
+      "def": "A designated cache tier in front of the origin that absorbs requests from all edges."
+    },
+    {
+      "term": "Connection pool",
+      "def": "A set of reusable open connections that workers borrow and return, avoiding handshakes."
+    },
+    {
+      "term": "Anycast",
+      "def": "Announcing the same IP from many locations via BGP so traffic reaches the nearest one."
+    },
+    {
+      "term": "BGP",
+      "def": "Border Gateway Protocol: how networks announce which IP ranges they can deliver to."
+    },
+    {
+      "term": "Cache key",
+      "def": "Identifier for a cached object: scheme + host + path + query (+ Vary'd headers)."
+    },
+    {
+      "term": "Cache hit ratio",
+      "def": "Fraction of requests served from cache without contacting the origin."
+    },
+    {
+      "term": "Cache purge",
+      "def": "Explicitly removing objects from the CDN cache before their TTL expires."
+    },
+    {
+      "term": "cf-cache-status",
+      "def": "Cloudflare response header: HIT, MISS, EXPIRED, REVALIDATED, UPDATING, STALE, DYNAMIC, BYPASS."
+    },
+    {
+      "term": "Stale-if-error / Always Online",
+      "def": "Serving an expired cached copy when the origin is down."
+    },
+    {
+      "term": "SSI",
+      "def": "Server Side Includes: directives in HTML comments that the origin server expands."
+    },
+    {
+      "term": "ESI",
+      "def": "Edge Side Includes: `<esi:include>` tags the CDN edge fills with fragments, caching the rest."
+    },
+    {
+      "term": "AJAX / fetch",
+      "def": "Browser-side async requests that fill dynamic parts of a cached page."
+    },
+    {
+      "term": "Railgun",
+      "def": "Discontinued Cloudflare tech sending only page deltas between an origin-side daemon and the edge."
+    },
+    {
+      "term": "Consistent hashing",
+      "def": "Key-to-node mapping on a hash ring so adding/removing a node remaps only ~1/N keys."
+    },
+    {
+      "term": "Thundering herd",
+      "def": "Many simultaneous misses for the same object all hitting the origin at once."
+    },
+    {
+      "term": "Request collapsing",
+      "def": "Only one request per cache key goes upstream; others wait for it (nginx `proxy_cache_lock`)."
+    },
+    {
+      "term": "WAF",
+      "def": "Web Application Firewall: rules that block attacks such as SQL injection and XSS at the edge."
+    },
+    {
+      "term": "Virtual patching",
+      "def": "Blocking an exploit with a WAF rule before the vulnerable software is fixed (e.g. Log4j)."
+    },
+    {
+      "term": "Rate limiting",
+      "def": "Capping requests per client over time (fixed window, sliding window, token/leaky bucket)."
+    },
+    {
+      "term": "Banner grabbing",
+      "def": "Learning server software/version from headers like Server or X-Powered-By to find known exploits."
+    },
+    {
+      "term": "ASN",
+      "def": "Autonomous System Number: identifies the network (ISP) an IP belongs to."
+    },
+    {
+      "term": "Edge compute",
+      "def": "Running code at CDN PoPs (Cloudflare Workers, Lambda@Edge, Akamai EdgeWorkers)."
+    },
+    {
+      "term": "Cache poisoning",
+      "def": "Getting a malicious or user-specific response stored under a shared cache key."
+    }
+  ],
+  "mcqs": [
+    {
+      "q": "Light in optical fibre travels at roughly 2/3 of c. What is the minimum one-way latency over 1,000 km of fibre?",
+      "options": [
+        "About 3.3 ms",
+        "About 4.9 ms",
+        "About 10 ms",
+        "About 1 ms"
+      ],
+      "answer": 1,
+      "explanation": "c ≈ 300,000 km/s divided by a refractive index of ≈ 1.47 gives ≈ 204,000 km/s, so 1,000 km takes ≈ 4.9 ms one way. No engineering can beat this, only shorter distance.",
+      "distractors": "3.3 ms is light in vacuum, and 10 ms is roughly the round-trip figure.",
+      "source": "lecture"
+    },
+    {
+      "q": "A quiz lists possible refractive indices for optical fibre. Which value is physically impossible?",
+      "options": [
+        "1.46",
+        "1.47",
+        "0.98",
+        "1.53"
+      ],
+      "answer": 2,
+      "explanation": "A refractive index is c divided by the speed in the medium. Light is slower in glass than in vacuum, so the value must be greater than 1.",
+      "distractors": "1.46–1.47 are typical for fibre and ~1.5 for ordinary glass.",
+      "source": "lecture"
+    },
+    {
+      "q": "You insert a plain reverse proxy between browser and origin with no caching and no connection reuse. What happens to TTFB?",
+      "options": [
+        "It increases slightly",
+        "It drops by half",
+        "It stays exactly the same",
+        "It drops to one RTT"
+      ],
+      "answer": 0,
+      "explanation": "An extra hop with no reuse adds processing and connection setup, so TTFB rises slightly (≈620 → 621–625 ms in the lecture). CDN gains come from caching, keep-alive and proximity, not from the hop itself.",
+      "distractors": "Savings appear only once connections are kept warm or the edge has a cache hit.",
+      "source": "lecture"
+    },
+    {
+      "q": "For a cacheable image, which setup gives the lowest TTFB?",
+      "options": [
+        "Browser opens a new connection directly to the origin",
+        "Browser → edge with a warm pool to origin, cache miss",
+        "Browser keeps a connection to the origin alive",
+        "Browser keeps a connection to a nearby edge alive and the edge has a cache hit"
+      ],
+      "answer": 3,
+      "explanation": "A cache hit means the origin isn't contacted, and keep-alive to a nearby edge leaves only one short RTT (≈11 ms in the lecture), less than the physical RTT to the origin.",
+      "distractors": "Every other option involves at least one long round trip to the distant origin.",
+      "source": "lecture"
+    },
+    {
+      "q": "For a user far from the origin, which is generally the worst for latency: forward proxy, reverse proxy or CDN?",
+      "options": [
+        "Forward proxy, because the user must configure it",
+        "Reverse proxy, because it sits next to the origin and doesn't shorten the user's path",
+        "CDN, because it adds the most hops",
+        "All three are identical"
+      ],
+      "answer": 1,
+      "explanation": "A reverse proxy near the origin adds a hop without moving anything closer to the user. A forward proxy is near the user, and a CDN puts edges near all users.",
+      "distractors": "Hop count matters less than physical distance and caching.",
+      "source": "lecture"
+    },
+    {
+      "q": "What is the main purpose of a tiered (mid-tier) cache between edges and the origin?",
+      "options": [
+        "Encrypt traffic between browser and edge",
+        "Replace DNS resolution",
+        "Let many edges share a larger, cheaper cache so fewer requests reach the origin",
+        "Store user sessions for login"
+      ],
+      "answer": 2,
+      "explanation": "Tiers are the warehouse to the edge's showroom: bigger caches in cheaper locations, shared by many PoPs. They raise the overall hit ratio and shield the origin.",
+      "distractors": "Encryption, DNS and sessions are unrelated to cache tiering.",
+      "source": "lecture"
+    },
+    {
+      "q": "Cloudflare returns the same IP address to users in Mumbai and in London, yet each reaches a local PoP. Which technique is this?",
+      "options": [
+        "Anycast: the same IP announced via BGP from many locations",
+        "GeoDNS returning different IPs",
+        "IP aliasing on one server",
+        "NAT at the user's ISP"
+      ],
+      "answer": 0,
+      "explanation": "With anycast, many PoPs announce the same prefix over BGP, and routing delivers each user to the nearest one.",
+      "distractors": "GeoDNS would return different IPs, and IP aliasing is one machine with many IPs (the opposite).",
+      "source": "lecture"
+    },
+    {
+      "q": "A response shows `cf-cache-status: REVALIDATED`. What happened?",
+      "options": [
+        "The object was served from cache without contacting the origin",
+        "The origin was down and a stale copy was served",
+        "The object is not cacheable by default",
+        "The cached copy was stale, so the edge sent a conditional request and the origin answered 304 Not Modified"
+      ],
+      "answer": 3,
+      "explanation": "REVALIDATED means the edge used If-None-Match or If-Modified-Since and got a 304. The origin was contacted but only a few bytes moved.",
+      "distractors": "That describes HIT, STALE and DYNAMIC respectively.",
+      "source": "lecture"
+    },
+    {
+      "q": "A product page is cached on the CDN, but the hit ratio is low because ad clicks append `?gclid=...` and `?fbclid=...`. What is the best fix?",
+      "options": [
+        "Disable caching for the page",
+        "Key on scheme + host + path, whitelist only the query parameters that change content, and sort them",
+        "Add `Vary: Cookie`",
+        "Shorten the TTL"
+      ],
+      "answer": 1,
+      "explanation": "Tracking parameters make every URL unique, and the query string is part of the cache key. Whitelisting meaningful params (and sorting them) collapses those variants back into one key.",
+      "distractors": "Vary: Cookie and shorter TTLs make the hit ratio worse, and disabling caching gives up entirely.",
+      "source": "lecture"
+    },
+    {
+      "q": "You replaced `logo.png` on the origin, but users still see the old logo via the CDN. What is the most reliable fix going forward?",
+      "options": [
+        "Restart the origin server",
+        "Add `Vary: User-Agent`",
+        "Use versioned or fingerprinted URLs (e.g. logo.3fa9.png), or purge the cache",
+        "Switch the site to HTTP/2"
+      ],
+      "answer": 2,
+      "explanation": "The URL is the cache key, so a new URL is a new object and the edge must fetch it. A purge also works for a one-off fix.",
+      "distractors": "Restarting the origin doesn't touch edge caches, and the other two don't affect the key.",
+      "source": "lecture"
+    },
+    {
+      "q": "A page has 2 personalised fragments and is viewed 100 times. With ESI at the edge (template cached), how many origin requests are made?",
+      "options": [
+        "201",
+        "100",
+        "2",
+        "300"
+      ],
+      "answer": 0,
+      "explanation": "1 fetch of the cacheable template + 100 × 2 fragment fetches = 201. The request count rises, but each fragment is tiny, so total bytes fall sharply.",
+      "distractors": "100 is the full-page origin render, and 300 counts the template on every view.",
+      "source": "lecture"
+    },
+    {
+      "q": "Which matches each technique to where the page is assembled?",
+      "options": [
+        "SSI: browser, ESI: origin, AJAX: edge",
+        "SSI: edge, ESI: browser, AJAX: origin",
+        "All three assemble on the origin",
+        "SSI: origin server, ESI: CDN edge, AJAX: browser"
+      ],
+      "answer": 3,
+      "explanation": "SSI expands includes on the origin web server, ESI fills holes at the CDN edge, and AJAX/fetch makes the browser the stitcher.",
+      "distractors": "The other mappings shuffle the layers.",
+      "source": "lecture"
+    },
+    {
+      "q": "A hot object expires and 10,000 users request it in the same second. Which nginx feature ensures only one request goes upstream?",
+      "options": [
+        "proxy_buffering",
+        "proxy_cache_lock (request collapsing)",
+        "keepalive_timeout",
+        "gzip_vary"
+      ],
+      "answer": 1,
+      "explanation": "proxy_cache_lock lets the first request for a key populate the cache while the others wait for it. This collapses the thundering herd into one origin fetch.",
+      "distractors": "Buffering, keep-alive timeouts and gzip_vary don't de-duplicate concurrent misses.",
+      "source": "lecture"
+    },
+    {
+      "q": "A login API has a fixed-window limit of 100 requests per minute. What is the worst case in a short burst?",
+      "options": [
+        "100 requests in any 60 s",
+        "Exactly 100 requests per calendar minute, never more",
+        "About 198 requests within ~2 s around the window boundary",
+        "50 requests per 30 s"
+      ],
+      "answer": 2,
+      "explanation": "99 requests at 0:59 and 99 at 1:00 each respect their own window but give 198 back-to-back. A sliding window or token bucket closes this gap.",
+      "distractors": "Option A describes a sliding window, and the other options ignore the boundary effect.",
+      "source": "lecture"
+    },
+    {
+      "q": "You enabled a WAF on your CDN, yet attackers still exploit SQL injection on the origin. What is the most likely missing control?",
+      "options": [
+        "Origin lockdown: the origin should accept traffic only from the CDN's IP ranges",
+        "A longer cache TTL",
+        "Enabling HTTP/3",
+        "Anycast routing"
+      ],
+      "answer": 0,
+      "explanation": "If the origin's IP is reachable directly, attackers bypass the WAF entirely. Locking the origin to CDN IPs forces every request through the WAF.",
+      "distractors": "TTL, HTTP/3 and anycast don't stop direct-to-origin traffic.",
+      "source": "lecture"
+    },
+    {
+      "q": "A cache cluster of 10 nodes uses consistent hashing. One node is added. Roughly what fraction of keys move?",
+      "options": [
+        "All keys",
+        "About half",
+        "None",
+        "About 1/11 of the keys"
+      ],
+      "answer": 3,
+      "explanation": "With consistent hashing only the keys in the new node's ring segments move, about 1/N of the total. Modulo hashing would remap almost everything.",
+      "distractors": "'All keys' describes `hash mod N`, and 'none' would mean the new node gets no load.",
+      "source": "lecture"
+    },
+    {
+      "q": "Using throughput ≈ MSS/(RTT·√p), if the RTT doubles while loss stays the same, TCP throughput roughly...",
+      "options": [
+        "doubles",
+        "halves",
+        "stays the same",
+        "drops by a factor of four"
+      ],
+      "answer": 1,
+      "explanation": "Throughput is inversely proportional to RTT, so doubling RTT halves it. This is why distant origins feel slow even on fast links.",
+      "distractors": "A factor of four would need a 16× change in loss, since the loss term is under a square root.",
+      "source": "lecture"
+    },
+    {
+      "q": "Which is NOT a real downside of putting your site behind a CDN?",
+      "options": [
+        "The CDN holds your TLS private keys and can impersonate you",
+        "A CDN outage can take your site down",
+        "Cache hits lower your TTFB",
+        "Heavy use of its WAF, Workers and rules causes vendor lock-in"
+      ],
+      "answer": 2,
+      "explanation": "Lower TTFB on cache hits is the benefit of a CDN, not a drawback.",
+      "distractors": "Key custody, single point of failure and lock-in are the risks the lecture listed.",
+      "source": "lecture"
+    },
+    {
+      "q": "Why do CDN security rules often strip the `X-Powered-By` header and server version strings?",
+      "options": [
+        "To prevent banner grabbing, where attackers look up known vulnerabilities for the advertised software version",
+        "To save cache space",
+        "Because HTTP/2 forbids them",
+        "To enable anycast"
+      ],
+      "answer": 0,
+      "explanation": "Advertising 'PHP/7.2' or 'nginx/1.14' tells attackers which CVEs to try. Hiding it makes targeted attacks slightly harder.",
+      "distractors": "The header is tiny, is legal in HTTP/2, and has nothing to do with routing.",
+      "source": "lecture"
+    }
+  ],
+  "short": [
+    {
+      "q": "Mumbai to AWS us-east-1 is about 13,000 km of fibre. Compute the minimum one-way latency and RTT (fibre ≈ 204,000 km/s), then the minimum time to first byte for a new HTTPS connection using TCP + TLS 1.3. Why is a CDN edge the only real fix?",
+      "checks": [
+        {
+          "label": "Uses ~4.9 ms per 1000 km or 204,000 km/s",
+          "patterns": [
+            "4\\.9",
+            "204,?000"
+          ]
+        },
+        {
+          "label": "One-way ≈ 64 ms",
+          "patterns": [
+            "6[3-5](\\.\\d+)? ?ms"
+          ]
+        },
+        {
+          "label": "RTT ≈ 127 ms",
+          "patterns": [
+            "12[5-8](\\.\\d+)? ?ms"
+          ]
+        },
+        {
+          "label": "TTFB = 3 RTT ≈ 380 ms",
+          "patterns": [
+            "3 ?(rtt|round)",
+            "3[78]\\d ?ms"
+          ]
+        },
+        {
+          "label": "Fix: move content closer / edge cache",
+          "patterns": [
+            "closer",
+            "near",
+            "edge"
+          ]
+        }
+      ],
+      "modelAnswer": "Light in fibre ≈ 204,000 km/s, which is about 4.9 ms per 1,000 km one way.\nOne-way: 13,000 km × 4.9 ms / 1,000 km ≈ 64 ms. RTT ≈ 127 ms (about 126 ms, as quoted in class). Real paths are longer and lossy, so measured values are higher.\nA new HTTPS connection with TCP + TLS 1.3 needs 1 RTT for the TCP handshake, 1 RTT for TLS 1.3, and 1 RTT for the request/response = 3 RTT ≈ 381 ms (about 380 ms) before the first byte, ignoring server time.\nProtocols can only remove round trips (keep-alive, QUIC). They can't make light faster. The only way to cut the per-RTT cost is to move the content closer to the user: a CDN edge ~10 ms away that answers from cache or holds warm connections to the origin.",
+      "explanation": "Check the arithmetic (≈64 ms one way, ≈127 ms RTT, 3 RTT ≈ 380 ms) and the conclusion that physics forces proximity."
+    },
+    {
+      "q": "Adding a proxy should increase latency, yet CDNs reduce TTFB. Explain the mechanisms, referring to the class timing table.",
+      "checks": [
+        {
+          "label": "Cache hit at the edge avoids the origin",
+          "patterns": [
+            "cache hit",
+            "\\bhit\\b"
+          ]
+        },
+        {
+          "label": "Keep-alive / warm connection pool to origin",
+          "patterns": [
+            "keep.?alive",
+            "warm",
+            "pool"
+          ]
+        },
+        {
+          "label": "Avoids handshake round trips",
+          "patterns": [
+            "handshake",
+            "round.?trip",
+            "\\brtt"
+          ]
+        },
+        {
+          "label": "Edge is physically close to the user",
+          "patterns": [
+            "close",
+            "near",
+            "short"
+          ]
+        },
+        {
+          "label": "A plain proxy with no reuse is slower",
+          "patterns": [
+            "plain proxy",
+            "no reuse",
+            "slower",
+            "increase"
+          ]
+        }
+      ],
+      "modelAnswer": "A plain proxy with no reuse does increase TTFB slightly (≈620 → 621–625 ms), because it's an extra hop that repeats the same long handshakes.\nA CDN wins in three ways:\n1. Proximity: the edge is close to the user (≈10 ms RTT), so the client's TCP + TLS handshake round trips are short.\n2. Keep-alive and a warm connection pool from edge to origin: the CDN controls its own network, so it keeps connections open and pays the expensive long-haul handshakes once. A cache miss then costs about 3 short RTTs + 1 long RTT (≈230 ms) instead of 3 long RTTs (≈620 ms).\n3. Cache hits: the edge answers from its own cache and the origin isn't contacted (≈33 ms on a new connection, ≈11 ms with a kept-alive client connection), which is less than the physical RTT to the origin.\nSo the hit ratio is critical: 99.9% versus 90% is a big difference in user experience.",
+      "explanation": "The examiner wants proximity, connection reuse (warm pools) and cache hits, plus the point that a bare proxy really is slower."
+    },
+    {
+      "q": "A viral video thumbnail expires and 50,000 requests arrive in one second across 300 edges. How do tiered caching and request collapsing protect the origin?",
+      "checks": [
+        {
+          "label": "Edges go to a tier / shield instead of origin",
+          "patterns": [
+            "tier",
+            "shield",
+            "mid"
+          ]
+        },
+        {
+          "label": "Request collapsing / cache lock",
+          "patterns": [
+            "collaps",
+            "cache.?lock",
+            "coalesc",
+            "proxy_cache_lock"
+          ]
+        },
+        {
+          "label": "Only one request per key goes upstream, others wait",
+          "patterns": [
+            "one request",
+            "single request",
+            "wait"
+          ]
+        },
+        {
+          "label": "Origin sees very few requests",
+          "patterns": [
+            "few",
+            "handful",
+            "only .* origin",
+            "origin (sees|gets|receives)"
+          ]
+        }
+      ],
+      "modelAnswer": "Without protection, each of the 300 edges misses and forwards many requests: a thundering herd that floods the origin.\nTiered caching: edges don't go to the origin directly. They go to a few mid-tier or shield caches (the warehouses), so at most a handful of tier nodes can ask the origin.\nRequest collapsing (cache lock, nginx proxy_cache_lock): at each edge and each tier, the first request for the cache key takes a lock and goes upstream, and every other request for that key waits and is served from that single response.\nCombined, 50,000 user requests become about one request per edge to the tier, and one request (or a few) from the tier to the origin. The origin sees only a handful of fetches, and everyone else is served from cache.",
+      "explanation": "Both mechanisms are needed: tiers funnel the edges, and the lock de-duplicates concurrent misses for one key."
+    },
+    {
+      "q": "Trace the evolution SSI → ESI → AJAX (→ Railgun) for caching personalised pages. Where is the page assembled in each case, and what is the requests-vs-bytes trade-off?",
+      "checks": [
+        {
+          "label": "SSI on the origin server",
+          "patterns": [
+            "ssi[^.]*(origin|server)"
+          ]
+        },
+        {
+          "label": "ESI at the CDN edge",
+          "patterns": [
+            "esi[^.]*edge"
+          ]
+        },
+        {
+          "label": "AJAX/fetch in the browser",
+          "patterns": [
+            "(ajax|fetch)[^.]*browser"
+          ]
+        },
+        {
+          "label": "Holes / fragments idea",
+          "patterns": [
+            "hole",
+            "fragment"
+          ]
+        },
+        {
+          "label": "More requests but fewer bytes",
+          "patterns": [
+            "more requests",
+            "requests (go up|increase|rise)",
+            "fewer bytes",
+            "bytes (drop|fall|reduce)"
+          ]
+        }
+      ],
+      "modelAnswer": "The idea throughout: most of a page is the same for everyone, and only small holes (name, cart) are personal. Cache the shell, fetch the holes.\nSSI (Server Side Includes): directives in HTML comments that the origin server expands, originally by forking programs. Assembly happens on the origin, so the full page still crosses the long link.\nESI (Edge Side Includes): the cached template with `<esi:include src=...>` holes lives at the CDN edge. The edge fetches only the fragments from the origin and stitches them in.\nAJAX/fetch: the static page or SPA is cached everywhere, and the browser fetches the dynamic fragments and fills the holes, so the browser is the stitcher.\nRailgun: an origin-side daemon and the edge keep the last version of each page and send only the delta.\nTrade-off: there are more requests but fewer bytes. With ESI, 100 views of a page with 2 fragments means 1 + 200 = 201 origin requests instead of 100, but each carries only a tiny fragment, so total bytes drop sharply.",
+      "explanation": "Look for the three assembly locations, the 'holes/fragments' idea, and the more-requests-fewer-bytes trade-off (201 vs 100)."
+    },
+    {
+      "q": "Design a CDN cache-key and caching strategy for an e-commerce site whose pages get ad-campaign traffic (gclid/fbclid) and whose static assets change on every deploy.",
+      "checks": [
+        {
+          "label": "Key on scheme + host + path",
+          "patterns": [
+            "scheme",
+            "host.*path"
+          ]
+        },
+        {
+          "label": "Whitelist meaningful query params / ignore tracking params",
+          "patterns": [
+            "whitelist",
+            "allow.?list",
+            "ignore",
+            "strip"
+          ]
+        },
+        {
+          "label": "Sort query parameters",
+          "patterns": [
+            "sort"
+          ]
+        },
+        {
+          "label": "Versioned / fingerprinted asset URLs or purge",
+          "patterns": [
+            "version",
+            "fingerprint",
+            "hash",
+            "purge"
+          ]
+        },
+        {
+          "label": "Avoid Vary on cookie/user-agent; only Accept-Encoding",
+          "patterns": [
+            "vary"
+          ]
+        }
+      ],
+      "modelAnswer": "1. Cache key = scheme + host + path, plus only whitelisted query parameters that actually change the content (e.g. page, sort, colour). Ignore or strip tracking parameters such as gclid, fbclid and utm_*, so ad traffic hits the same cached object.\n2. Sort the remaining query parameters so ?a=1&b=2 and ?b=2&a=1 map to one key.\n3. Keep Vary limited to Accept-Encoding (gzip/br variants). Never Vary on Cookie or User-Agent, which fragments the cache and causes misses.\n4. Static assets: use versioned or fingerprinted filenames (app.3fa9c1.js, logo.v2.png) with a long max-age (e.g. 1 year), so a deploy produces new URLs and the old cache is never wrong. Use a purge only for emergencies.\n5. HTML: short edge TTL or no cache, with personalised parts filled by fetch/ESI. Personal responses get Cache-Control: private/no-store so one user's page is never served to everyone (avoiding cache poisoning).",
+      "explanation": "A strong answer tightens the key (path + whitelisted, sorted query), limits Vary, and uses versioned URLs for assets."
+    },
+    {
+      "q": "List ways a CDN can be 'abused' beyond caching to protect and offload an origin, and the risks this creates.",
+      "checks": [
+        {
+          "label": "WAF (SQL injection / XSS / virtual patching)",
+          "patterns": [
+            "waf",
+            "firewall"
+          ]
+        },
+        {
+          "label": "Rate limiting",
+          "patterns": [
+            "rate.?limit"
+          ]
+        },
+        {
+          "label": "DDoS absorption",
+          "patterns": [
+            "ddos"
+          ]
+        },
+        {
+          "label": "Origin lockdown to CDN IPs",
+          "patterns": [
+            "lockdown",
+            "only (accept|allow)",
+            "cdn ip",
+            "shield"
+          ]
+        },
+        {
+          "label": "Risks: TLS keys / single point of failure / lock-in",
+          "patterns": [
+            "private key",
+            "tls key",
+            "single point",
+            "lock.?in",
+            "outage"
+          ]
+        }
+      ],
+      "modelAnswer": "Because every request already passes through the edge, the CDN can:\n- run a WAF that blocks SQL injection (' OR 1=1 --), XSS and scanners, and virtually patches zero-days like Log4j with a rule before the code is fixed;\n- apply rate limiting on login, OTP, registration and orders (sliding window or token bucket rather than fixed window);\n- absorb DDoS attacks (e.g. ~31 Tbps) across its distributed network;\n- terminate TLS, compress, strip banner headers (X-Powered-By), add geo/ASN headers, enforce CORS;\n- act as an API gateway: verify JWTs and cookies at the edge, fail over between origins on high 5xx rate or latency, and run edge compute (Workers, Lambda@Edge).\nAll of this needs origin lockdown: the origin must only accept traffic from CDN IP ranges, or attackers simply bypass the edge.\nRisks: the CDN holds your TLS private keys and can impersonate you; it's a single point of failure (a CDN outage takes your site down); it has takedown power over you; vendor lock-in grows as you depend on its WAF, Workers and rules; and a misconfigured cache key can cause cache poisoning.",
+      "explanation": "Expect the security/offload features, the origin-lockdown prerequisite, and at least one key risk (keys, single point of failure, lock-in)."
+    },
+    {
+      "q": "Compare fixed-window and sliding-window rate limiting with a numeric example. Why do CDNs prefer to enforce rate limits at the edge?",
+      "checks": [
+        {
+          "label": "Fixed window boundary burst example (e.g. 99+99=198)",
+          "patterns": [
+            "198",
+            "double",
+            "2x",
+            "twice"
+          ]
+        },
+        {
+          "label": "Sliding window counts the last N seconds continuously",
+          "patterns": [
+            "sliding"
+          ]
+        },
+        {
+          "label": "Mentions window boundary",
+          "patterns": [
+            "boundary",
+            "edge of the window",
+            "end of (one|the) window"
+          ]
+        },
+        {
+          "label": "Edge sees all requests / no need to implement in every service",
+          "patterns": [
+            "every service",
+            "each service",
+            "all requests",
+            "before .*origin",
+            "origin"
+          ]
+        }
+      ],
+      "modelAnswer": "Fixed (tumbling) window: counts requests per fixed minute (0:00–0:59, 1:00–1:59) with a limit of 100. A client can send 99 at 0:59 and 99 at 1:00. Both windows are under the limit, yet 198 requests (about double the limit) arrive in about 2 seconds around the window boundary.\nSliding window: at any instant it counts the requests in the previous 60 seconds, so the 99 + 99 burst is caught (198 > 100) and the excess is blocked. Token or leaky buckets similarly enforce an average rate with a controlled burst.\nThe edge is the right place because it already sees all requests, along with the client IP, ASN and network, before they reach the origin. Abusive traffic is dropped close to the source, the origin is spared the load, and the limit doesn't have to be reimplemented in every service.",
+      "explanation": "The boundary-burst example and the sliding-window fix are the core; the edge rationale is visibility of all requests and offloading the origin."
+    }
+  ]
+}
