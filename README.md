@@ -45,7 +45,3 @@ tools/build.py             regenerates pages and data, and validates everything
 
 To rebuild after editing anything in `data/content/` or `data/quiz/`, run `python3 tools/build.py`. The build fails if
 any content is malformed, or if a written question's model answer doesn't pass its own checks.
-
-## Hosting
-
-Repo → **Settings → Pages → Deploy from a branch → `main` / `(root)` → Save**. Plain static files, with `.nojekyll`.
